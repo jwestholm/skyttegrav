@@ -43,7 +43,7 @@ class TestDisplayAndMaterials(unittest.TestCase):
             for kind in fetch.MAPS:
                 f=Path(d)/('brown_mud_'+kind+'.png')
                 self.assertTrue(f.is_file())
-                with Image.open(f) as saved:self.assertEqual(saved.size,(512,512))
+                with Image.open(f) as saved:self.assertEqual(saved.size,(1024,1024))
 
 
 if __name__=='__main__': unittest.main()

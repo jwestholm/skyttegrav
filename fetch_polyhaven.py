@@ -23,9 +23,11 @@ from PIL import Image, UnidentifiedImageError
 BASE = Path(__file__).resolve().parent
 OUT = BASE / 'assets' / 'polyhaven'
 API = 'https://api.polyhaven.com/files/'
-ASSETS = ('brown_mud', 'brown_mud_02', 'mud_forest', 'roots')
+ASSETS = ('brown_mud', 'brown_mud_02', 'mud_forest', 'roots',
+          'pine_bark', 'bark_willow', 'wood_planks', 'wood_planks_grey',
+          'mossy_rock', 'wood_planks_dirt')
 MAPS = ('diff', 'nor_gl')
-USER_AGENT = 'Skyttegrav-Material-Downloader/2.5.1 (+https://polyhaven.com/)'
+USER_AGENT = 'Skyttegrav-Material-Downloader/2.7 (+https://polyhaven.com/)'
 
 
 def open_url(url, timeout=25):
@@ -48,7 +50,7 @@ def walk_records(node, path=()):
 
 
 def choose(tree, map_type):
-    """Pick a 1K (or 2K) image matching one exact Poly Haven map type."""
+    """Prefer 2K source data; persist as 1K for bounded VRAM in prototype."""
     candidates = []
     for path, record in walk_records(tree):
         url = record['url']
@@ -61,7 +63,7 @@ def choose(tree, map_type):
             continue
         if map_type == 'nor_gl' and 'nor_dx' in search:
             continue
-        resolution = 0 if re.search(r'(?:^|[_/])1k(?:[_/.]|$)', search) else 1 if re.search(r'(?:^|[_/])2k(?:[_/.]|$)', search) else 3
+        resolution = 0 if re.search(r'(?:^|[_/])2k(?:[_/.]|$)', search) else 1 if re.search(r'(?:^|[_/])1k(?:[_/.]|$)', search) else 3
         fmt_rank = {'.png': 0, '.jpg': 1, '.jpeg': 1, '.webp': 2}[suffix]
         candidates.append(((resolution, fmt_rank, len(url)), url))
     return min(candidates)[1] if candidates else None
@@ -104,12 +106,19 @@ def doctor():
         return False
 
 
-def fetch_all(force=False):
+def fetch_all(force=False, selected=None):
     OUT.mkdir(parents=True, exist_ok=True)
-    manifest = {'provider': 'https://polyhaven.com/', 'license': 'CC0', 'assets': {}}
+    manifest_path=OUT/'SOURCES.json'
+    try:
+        manifest=json.loads(manifest_path.read_text(encoding='utf-8')) if manifest_path.exists() else {}
+    except (ValueError,OSError):
+        manifest={}
+    if not isinstance(manifest,dict):manifest={}
+    manifest.update({'provider':'https://polyhaven.com/','license':'CC0'})
+    manifest.setdefault('assets',{})
     succeeded = 0
     failed = 0
-    for asset in ASSETS:
+    for asset in (ASSETS if selected is None else (selected,)):
         targets = {key: OUT / f'{asset}_{key}.png' for key in MAPS}
         needed = [kind for kind in MAPS if force or not targets[kind].is_file()]
         if not needed:
@@ -123,7 +132,7 @@ def fetch_all(force=False):
             print(f'  API ERROR ({type(exc).__name__}): {exc}')
             failed += len(needed)
             continue
-        manifest['assets'][asset] = {}
+        manifest['assets'].setdefault(asset, {})
         for kind in MAPS:
             if kind not in needed:
                 succeeded += 1
@@ -138,7 +147,7 @@ def fetch_all(force=False):
                 raw = open_url(url, timeout=60)
                 with Image.open(BytesIO(raw)) as im:
                     im.load()
-                    converted = im.convert('RGB').resize((512, 512),
+                    converted = im.convert('RGB').resize((1024, 1024),
                         Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.LANCZOS)
                     # Atomic replacement: no half-written image if download/process fails.
                     temp_path = targets[kind].with_suffix('.tmp.png')
@@ -166,8 +175,9 @@ def main():
     group.add_argument('--check', action='store_true', help='show installed maps (offline)')
     group.add_argument('--doctor', action='store_true', help='check DNS and official API')
     group.add_argument('--force', action='store_true', help='redownload maps')
+    parser.add_argument('--asset', choices=ASSETS, help='download just one asset (otherwise all)')
     args = parser.parse_args()
-    ok = check_local() if args.check else doctor() if args.doctor else fetch_all(args.force)
+    ok = check_local() if args.check else doctor() if args.doctor else fetch_all(args.force, selected=args.asset)
     return 0 if ok else 1
 
 

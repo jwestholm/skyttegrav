@@ -24,7 +24,7 @@ def runtime_geometry():
         'wall_offset','surface_material','hill_y','world_on_ground',
         'obstacles_in_range','trench_obstacle','obstacle_steering',
         'draw_trench_obstacles','bar','blob','vec_normal','box','local_box',
-        'beam_world','scene_at','scenery_chunk','environment_chunk','make_chunk',
+        'beam_world','scene_at','scenery_chunk','environment_chunk','trench_detail_props','make_chunk',
     }
     class_names={'MeshBuilder','TrenchObstacle','SoldierBrain'}
     selected=[node for node in tree.body if isinstance(node,(ast.FunctionDef,ast.ClassDef))

@@ -25,7 +25,9 @@ ROOT = Path(__file__).resolve().parent
 # Skjutbana defaults to 800x600 (4:3); the calibrated viewport can differ.
 # This is a standalone *window default*, not the physical camera calibration.
 W, H = 800, 600
-CAMERA_VERTICAL_FOV = 80.0  # Slightly wider vertical field, adjustable separately from window size.
+CAMERA_VERTICAL_FOV = 80.0  # Camera geometry remains independent of physical shooting distance.
+TEXTURE_SIZE = 1024  # Was 512; 2048 possible for GTX 1070 after profiling.
+SUN_DIRECTION = (0.35, 0.085, 0.93)  # Fixed celestial direction in WORLD coordinates.
 # Initial lift from desktop/window-manager placement; F9/F10 move in 12px steps.
 WINDOW_RAISE_PIXELS = 28
 OBSTACLE_SPACING = 13.0  # sparse, legible traversals without cluttering blind corners
@@ -92,10 +94,10 @@ uniform int use_pbr_normals;
 out vec4 f_color;
 void main(){
     vec3 n=normalize(v_normal);
-    vec3 sun=normalize(vec3(-0.4,0.9,0.45));
+    vec3 sun=normalize(vec3(0.35,0.16,0.93));
     // Tangent-space normal mapping using world-position/UV derivatives.
     // Only use it on earth layers, where surface UVs and derivatives are valid.
-    if (use_pbr_normals == 1 && v_layer >= 0 && v_layer <= 3) {
+    if (use_pbr_normals == 1 && v_layer >= 0 && v_layer <= 19) {
         vec3 tangent_norm = texture(material_normals, vec3(v_uv, float(v_layer))).xyz * 2.0 - 1.0;
         vec3 dp1=dFdx(v_world), dp2=dFdy(v_world);
         vec2 duv1=dFdx(v_uv), duv2=dFdy(v_uv);
@@ -108,7 +110,7 @@ void main(){
         }
     }
     float diffuse=max(dot(n,sun),0.0);
-    float brightness=0.58+0.46*diffuse;
+    float brightness=0.58+0.50*diffuse;
     // Subtle animated light from lamps, approximate until shadow-map pass.
     float lantern=pow(max(0.0, sin(v_world.z*0.09+2.0)),12.0);
     brightness += 0.09*lantern*max(0.0, 1.0-v_distance/15.0);
@@ -136,20 +138,35 @@ void main(){uv=xy*.5+.5;gl_Position=vec4(xy,0.9999,1.0);}
 SKYFRAG = '''#version 330
 in vec2 uv;
 out vec4 f_color;
-uniform float horizon;
+uniform vec3 sky_right;
+uniform vec3 sky_up;
+uniform vec3 sky_forward;
+uniform vec3 sun_direction;
+uniform float tan_half_fov;
+uniform float view_aspect;
 void main(){
- float y=uv.y;
- vec3 top=vec3(.17,.23,.29);
- vec3 low=vec3(.61,.49,.43);
- vec3 col=mix(low,top,smoothstep(.14,.95,y));
- float sun=1.-smoothstep(.027,.033,length((uv-vec2(.73,.51))*vec2(1.75,1.0)));
- col=mix(col,vec3(.94,.62,.38),sun*.85);
- // Earth-coloured backstop below the visual horizon: hides sky-blue bleed
- // through tiny cracks. This is a visual fallback, NOT a geometry repair.
- vec3 soil=vec3(.095,.073,.055);
- float soil_mask=1.0-smoothstep(.39,.48,y);
- col=mix(col,soil,soil_mask);
- f_color=vec4(col,1.);
+    // A true infinitely distant sky: camera TRANSLATION must not affect it.
+    // Derive one world-space viewing ray per pixel using camera orientation.
+    vec2 ndc = uv*2.0-1.0;
+    vec3 ray = normalize(sky_forward
+      + sky_right*(ndc.x*tan_half_fov*view_aspect)
+      + sky_up*(ndc.y*tan_half_fov));
+    vec3 sun=normalize(sun_direction);
+    float altitude=ray.y;
+    vec3 horizon=vec3(.48,.40,.37);
+    vec3 high=vec3(.13,.19,.25);
+    float sky_height=smoothstep(-.03,.70,altitude);
+    vec3 col=mix(horizon,high,sky_height);
+    float sun_angle=acos(clamp(dot(ray,sun),-1.0,1.0));
+    float disc=1.0-smoothstep(.017,.024,sun_angle);
+    float glow=exp(-sun_angle*sun_angle/0.018);
+    col+=vec3(.27,.13,.06)*glow;
+    col=mix(col,vec3(.96,.69,.44),disc*.90);
+    // Dark earth backstop is only a last-resort mask for tiny geometry gaps.
+    // Its boundary also follows world-space horizon, not screen UVs.
+    vec3 soil=vec3(.095,.073,.055);
+    col=mix(col,soil,1.0-smoothstep(-.085,-.012,altitude));
+    f_color=vec4(col,1.0);
 }
 '''
 
@@ -359,26 +376,54 @@ def world_on_ground(s, offset, lift=0.0):
     return world(s, offset, hill_y(s, side, offset) + lift)
 
 
-def bar(mesh, p, q, radius, material, facets=5, repeat=.28):
-    """World-space low-poly cylinder between points (trunks, branches, wire)."""
-    import numpy as _np
-    a=_np.array(p,dtype=float); b=_np.array(q,dtype=float)
-    axis=b-a; length=float(_np.linalg.norm(axis))
-    if length<.0001: return
+def bar(mesh, p, q, radius, material, facets=10, repeat=.28):
+    """Textured irregular cylindrical timber. Caps + tapered rings avoid tubes.
+
+    No GL state or random calls; deterministic from endpoints and seed.
+    Costs are bounded to at most two axial spans per prop for chunk streaming.
+    """
+    a=np.asarray(p,dtype=float);b=np.asarray(q,dtype=float)
+    axis=b-a; length=float(np.linalg.norm(axis))
+    if length<.0001:return
     direction=axis/length
-    helper=_np.array((0.,1.,0.)) if abs(direction[1])<.87 else _np.array((1.,0.,0.))
-    u=_np.cross(direction,helper); u/=max(1e-9,_np.linalg.norm(u))
-    v=_np.cross(direction,u)
-    for j in range(facets):
-        an=2*math.pi*j/facets;bn=2*math.pi*(j+1)/facets
-        c=a+radius*(math.cos(an)*u+math.sin(an)*v)
-        d=a+radius*(math.cos(bn)*u+math.sin(bn)*v)
-        e=b+radius*(math.cos(bn)*u+math.sin(bn)*v)
-        f=b+radius*(math.cos(an)*u+math.sin(an)*v)
-        mesh.quad(c,d,e,f,material,((j/facets,0),((j+1)/facets,0),((j+1)/facets,length/repeat),(j/facets,length/repeat)))
+    helper=np.array((0.,1.,0.)) if abs(direction[1])<.87 else np.array((1.,0.,0.))
+    u=np.cross(direction,helper); u/=max(1e-9,float(np.linalg.norm(u)))
+    v=np.cross(direction,u)
+    facets=max(6,int(facets))
+    spans=2 if radius>=.050 and length>.85 else 1
+    seed_phase=a[0]*1.77+a[1]*2.49+a[2]*.81+b[2]*.31
+    rings=[]
+    for k in range(spans+1):
+        t=k/spans
+        spine=a+axis*t
+        # Minute lateral bend creates real wood silhouettes without camera snap.
+        if 0<k<spans:spine+=radius*.12*math.sin(seed_phase*3.0)*u
+        ring=[]
+        for j in range(facets):
+            angle=2*math.pi*j/facets
+            irregular=1.0+.065*math.sin(seed_phase*2+j*2.57+k*.63)
+            taper=1.0-.07*t
+            point=spine+radius*irregular*taper*(math.cos(angle)*u+math.sin(angle)*v)
+            ring.append(tuple(point))
+        rings.append(ring)
+    for k in range(spans):
+        for j in range(facets):
+            nj=(j+1)%facets
+            mesh.quad(rings[k][j],rings[k][nj],rings[k+1][nj],rings[k+1][j],material,
+                      ((j/facets,k*length/(spans*repeat)),
+                       ((j+1)/facets,k*length/(spans*repeat)),
+                       ((j+1)/facets,(k+1)*length/(spans*repeat)),
+                       (j/facets,(k+1)*length/(spans*repeat))))
+    # Chopped ends: no hollow cylinders visible near camera.
+    for end_idx,center in ((0,a),(-1,b)):
+        for j in range(facets):
+            nj=(j+1)%facets
+            # A narrow strip across the cap; face has wood grain rather than sky.
+            mesh.quad(tuple(center),rings[end_idx][j],rings[end_idx][nj],tuple(center),material,
+                      ((.5,.5),(j/facets,0),((j+1)/facets,0),(.5,.5)))
 
 
-def blob(mesh, center, radii, layer, segments=7, rows=3, phase=0.0):
+def blob(mesh, center, radii, layer, segments=12, rows=5, phase=0.0):
     """Convex low-poly irregular ellipsoid. No translucent billboard artifacts."""
     cx,cy,cz=center; rx,ry,rz=radii
     def pt(theta,phi):
@@ -406,52 +451,61 @@ def scenery_chunk(mesh, start):
     for s_index in range(int(start)+2,int(start+CHUNK_LEN)-2,4):
         s=float(s_index)+rng.uniform(-.5,.5)
         if near_junction(s,10):continue
+        theme=scene_at(s)
+        density={'forest':.91,'rocky':.78,'exposed':.22,'ruined':.65,
+                 'marsh':.49,'fortified':.40}[theme]
         for side in (-1,1):
-            if rng.random()>.65: continue
+            if rng.random()>density: continue
             dist=rng.uniform(3.5,22.0)
             off=side*dist
             ground=world_on_ground(s,off)
+            # Preserve coherent BIOMES instead of equal tree/rock probabilities
+            # everywhere. No preloaded world; theme can be recomputed per chunk.
             choice=rng.random()
+            if theme=='rocky':choice=.75+choice*.25
+            elif theme=='ruined':choice=.29+choice*.25 if choice<.74 else .80+choice*.20
+            elif theme=='forest':choice=choice*.70
+            elif theme=='exposed':choice=.49+choice*.51
             scale=rng.uniform(.7,1.35)
             if choice<.28:  # whole tree: textured bark + irregular leafy crown
                 height=rng.uniform(4.5,8.5)*scale
                 top=(ground[0],ground[1]+height,ground[2])
-                bar(mesh,ground,top,.13*scale,5,7,1.0)
+                bar(mesh,ground,top,.13*scale,13 if rng.random()<.58 else 14,12 if dist<12 else 8,1.0)
                 for k in range(2):
                     yy=ground[1]+height*(.45+.16*k)
                     ang=rng.uniform(-math.pi,math.pi)
                     branch_end=(ground[0]+math.cos(ang)*1.35*scale, yy+.65*scale,
                                 ground[2]+math.sin(ang)*1.35*scale)
-                    bar(mesh,(ground[0],yy,ground[2]),branch_end,.06*scale,5,5,.65)
+                    bar(mesh,(ground[0],yy,ground[2]),branch_end,.06*scale,13 if k else 14,9,.65)
                 blob(mesh,(top[0],top[1]-.55*scale,top[2]),
-                     (1.35*scale,1.7*scale,1.35*scale),6,8,4,rng.random()*7)
+                     (1.15*scale,1.48*scale,1.18*scale),6,14 if dist<12 else 9,6 if dist<12 else 4,rng.random()*7)
                 # detached clumps add asymmetry
                 for k in range(2):
                     ang=rng.uniform(-math.pi,math.pi)
                     d=rng.uniform(.5,1.3)*scale
                     blob(mesh,(top[0]+math.cos(ang)*d,top[1]-1.0*scale,
-                               top[2]+math.sin(ang)*d),(.75*scale,.83*scale,.8*scale),6,7,3,rng.random()*7)
+                               top[2]+math.sin(ang)*d),(.76*scale,.78*scale,.78*scale),6,11 if dist<12 else 8,5 if dist<12 else 3,rng.random()*7)
             elif choice<.51: # snapped and splintered trunk
                 height=rng.uniform(1.7,4.8)*scale
                 top=(ground[0]+rng.uniform(-.27,.27),ground[1]+height,ground[2]+rng.uniform(-.27,.27))
-                bar(mesh,ground,top,.16*scale,5,7,.8)
+                bar(mesh,ground,top,.16*scale,13 if rng.random()<.5 else 14,12 if dist<12 else 8,.8)
                 for k in range(2):
                     t=.55+.18*k; ay=ground[1]+height*t
                     end=(ground[0]+rng.uniform(-1.4,1.4)*scale,ay+rng.uniform(.1,.6),
                          ground[2]+rng.uniform(-1.4,1.4)*scale)
-                    bar(mesh,(ground[0],ay,ground[2]),end,.06*scale,5,5,.6)
+                    bar(mesh,(ground[0],ay,ground[2]),end,.06*scale,13,9,.6)
                 # broken top gets a smaller angled splinter
-                bar(mesh,top,(top[0]+.22*scale,top[1]+.3*scale,top[2]-.16*scale),.06*scale,5,4,.5)
+                bar(mesh,top,(top[0]+.22*scale,top[1]+.3*scale,top[2]-.16*scale),.06*scale,16,8,.5)
             elif choice<.72: # bush, different size + number of clumps
                 for k in range(rng.randint(2,4)):
                     ang=rng.uniform(-math.pi,math.pi)
                     rr=rng.uniform(.05,.6)*scale
                     blob(mesh,(ground[0]+math.cos(ang)*rr,ground[1]+.45*scale,ground[2]+math.sin(ang)*rr),
-                         (.64*scale,.58*scale,.72*scale),6,7,3,rng.random()*5)
+                         (.64*scale,.58*scale,.72*scale),6,11 if dist<12 else 8,5 if dist<12 else 3,rng.random()*5)
             else: # surface stone / small boulder: visible ground contact
                 rad=rng.uniform(.23,.87)*scale
                 blob(mesh,(ground[0],ground[1]+rad*.38,ground[2]),
-                     (rad,rad*.68,rad*rng.uniform(.7,1.35)),7,7,3,rng.random()*5)
+                     (rad,rad*.68,rad*rng.uniform(.7,1.35)),17 if rng.random()<.62 else 7,13 if dist<12 else 9,5 if dist<12 else 4,rng.random()*5)
     # Old field wire — twisted wire between irregular short stakes, safely
     # *outside* the trench. Repeated every ~28 m, not a continuous wall.
     for base in range(int(start//28)*28,int((start+CHUNK_LEN)//28)*28+1,28):
@@ -590,7 +644,7 @@ def draw_trench_obstacles(mesh,start):
         s,c=ob.s,ob.lateral
         rng=random.Random(SEED*89+ob.index*113)
         if ob.kind=='crate':
-            local_box(mesh,s,c,-.04,ob.length,ob.width,ob.height,9)
+            local_box(mesh,s,c,-.04,ob.length,ob.width,ob.height,15 if rng.random()<.6 else 16)
             # Dark corner straps and raised edge rails make silhouette readable.
             for ds in (-ob.length*.37,ob.length*.37):
                 local_box(mesh,s+ds,c,ob.height-.04,.055,ob.width+.025,.045,10)
@@ -602,7 +656,7 @@ def draw_trench_obstacles(mesh,start):
                 dc=rng.uniform(-ob.width*.22,ob.width*.22)
                 r=rng.uniform(.095,.17)
                 p=world(s+ds,c+dc,r*.52)
-                blob(mesh,p,(r,r*.84,r*.82),7 if j%3 else 1,7,3,j+.3)
+                blob(mesh,p,(r,r*.84,r*.82),17 if j%3 else 1,12,5,j+.3)
             # A broken board poking out of the earth heap.
             beam_world(mesh,world(s-.32,c-.13,.10),world(s+.18,c+.22,.38),.047,8)
         elif ob.kind=='timber':
@@ -616,7 +670,7 @@ def draw_trench_obstacles(mesh,start):
                 for j in range(3-row):
                     dc=(j-(2-row)/2)*.29
                     center=world(s+(row-.5)*.15,c+dc,.11+row*.14)
-                    blob(mesh,center,(.23,.115,.19),9,9,3,rng.random()*10)
+                    blob(mesh,center,(.23,.115,.19),19,13,5,rng.random()*10)
         else:  # shallow water; no collision requirement
             local_box(mesh,s,c,-.035,ob.length,ob.width,.015,12)
     # Decorative, NON-colliding fragments stay close to the dirt wall. Their
@@ -630,7 +684,7 @@ def draw_trench_obstacles(mesh,start):
         inset=max(.65,wall_width(ss,side)-.115)
         lateral=side*inset
         r=.10+.065*noise(index,717)
-        blob(mesh,world(ss,lateral,.035),(.14,r,.16),7,7,3,index*.17)
+        blob(mesh,world(ss,lateral,.035),(.14,r,.16),17,11,4,index*.17)
         if noise(index,718)>.38:
             a=world(ss-.32,lateral,.065)
             b=world(ss+.48,lateral-side*.045,.082)
@@ -660,7 +714,8 @@ def local_box(mesh, s, lateral, y, length, width, height, material):
 
 
 def beam_world(mesh, a, b, thickness=.10, material=8):
-    bar(mesh,a,b,thickness,material,facets=7,repeat=.7)
+    # Only sizeable logs receive rounded cross-sections. Thin wires stay cheap.
+    bar(mesh,a,b,thickness,material,facets=11 if thickness>=.06 else 7,repeat=.76)
 
 
 def environment_chunk(mesh,start):
@@ -677,7 +732,8 @@ def environment_chunk(mesh,start):
         if theme in ('fortified','ruined','marsh','forest') and k%2==0:
             # duckboards differ in length/rotation slightly, sit flush with mud
             width=max(1.0,2*min(wall_width(s,-1),wall_width(s,1))-.30)+rng.uniform(-.06,.06)
-            local_box(mesh,s,0,-.040,.79,width,.055,8)
+            local_box(mesh,s+(rng.random()-.5)*.09,0,-.040,.78,width,.055,
+                      15 if rng.random()<.37 else 16 if rng.random()<.63 else 18)
         if theme in ('marsh','ruined') and k%5==2:
             # dark reflective-looking wet mud patches, slightly above the floor
             local_box(mesh,s,rng.uniform(-.42,.42),-.029,rng.uniform(.7,1.65),
@@ -690,19 +746,35 @@ def environment_chunk(mesh,start):
                 if rng.random()<(.9 if theme=='fortified' else .58):
                     b=world(s,side*(wall_offset(s,side,0,h)-.09),-.025)
                     t=world(s,side*(wall_offset(s,side,min(h-.13,2.1),h)-.09),min(h-.13,2.1))
-                    beam_world(mesh,b,t,.082 if theme!='ruined' else .072)
+                    beam_world(mesh,b,t,.082 if theme!='ruined' else .072, 13 if noise(k+side,801)<.4 else 14)
         # Revetments are substantial, irregular sections of actual timber,
         # not evenly repeated corridor rails. Follow each bank's current width.
         if theme in ('fortified','ruined','forest') and k%4==0:
             for side in (-1,1):
-                if theme=='forest' and rng.random()>.48: continue
-                for jf in (.22,.44,.67,.85):
-                    sy=s-1.9; ey=s+1.9
-                    hs=wall_height(sy,side);he=wall_height(ey,side)
-                    ys=hs*jf;ye=he*jf
-                    a=world(sy,side*(wall_offset(sy,side,ys,hs)-.10),ys)
-                    b=world(ey,side*(wall_offset(ey,side,ye,he)-.10),ye)
-                    beam_world(mesh,a,b,.078 if theme=='fortified' else .063)
+                zone=int((s+side*3.0)//15.0)
+                style=noise(zone, 900+side)
+                if theme=='forest' and noise(zone,914+side)>.78: continue
+                if style<.16:  # sometimes raw earth, not a corridor of endless rails
+                    continue
+                if style<.68:  # hand-built horizontal timber, missing/uneven rails
+                    for j,jf in enumerate((.22,.44,.67,.85)):
+                        if noise(zone*17+j,850+side)<.13:continue
+                        sy=s-1.9; ey=s+1.9
+                        hs=wall_height(sy,side);he=wall_height(ey,side)
+                        drift=(noise(zone*11+j,810)-.5)*.08
+                        ys=hs*(jf+drift);ye=he*(jf+drift)
+                        a=world(sy,side*(wall_offset(sy,side,ys,hs)-.09),ys)
+                        b=world(ey,side*(wall_offset(ey,side,ye,he)-.09),ye)
+                        tone=13 if noise(zone+j,812)<.32 else 14 if noise(zone+j,813)<.48 else 8
+                        beam_world(mesh,a,b,.079 if theme=='fortified' else .066,tone)
+                else:  # weathered plank shoring, with narrow irregular gaps
+                    for idx in range(5):
+                        ss=s-1.65+idx*.78
+                        hs=wall_height(ss,side)
+                        ytop=min(2.3,hs-.12) *(.85+.13*noise(zone*23+idx,811))
+                        w=wall_offset(ss,side,ytop*.45,hs)-.13
+                        local_box(mesh,ss,side*w,-.018,.58,.085,ytop,
+                                  15 if noise(zone*33+idx,817)<.34 else 16 if noise(zone*33+idx,818)<.52 else 18)
         if theme in ('fortified','ruined') and k%23==11:
             side=1 if rng.random()<.5 else -1
             w=wall_width(s,side)
@@ -714,7 +786,7 @@ def environment_chunk(mesh,start):
             for r in range(2):
                 for q in range(3):
                     base=world(s+(q-1)*.47,side*(wall_width(s,side)+.16),h+.11+r*.20)
-                    blob(mesh,base,(.37,.16,.26),9,10,4,rng.random()*10)
+                    blob(mesh,base,(.37,.16,.26),19,13,5,rng.random()*10)
         if theme=='fortified' and k%37==16:
             side=-1 if rng.random()<.5 else 1
             w=wall_width(s,side)
@@ -739,6 +811,82 @@ def environment_chunk(mesh,start):
         if i%2==0:
             local_box(mesh,s,side*d,point[1],rng.uniform(1.5,3.0),1.4,rng.uniform(2,4.2),10)
 
+
+def trench_detail_props(mesh, start):
+    """Bounded, seed-stable scene dressing close to bank, not artificial blockers.
+
+    Real traversal obstacles are STILL emitted by draw_trench_obstacles and read
+    by SoldierBrain. Everything here fits in a shallow wall-side visual strip.
+    The small variation library is a placeholder for future GLB asset instances.
+    """
+    first=max(0,int((start-10.0)//6.7)-1)
+    last=int((start+CHUNK_LEN-10.0)//6.7)+2
+    for index in range(first,last):
+        s=10.0+index*6.7+(noise(index,1001)-.5)*2.0
+        if not start<=s<start+CHUNK_LEN:continue
+        if near_junction(s,5.0):continue
+        side=-1 if noise(index,1002)<.5 else 1
+        w=wall_width(s,side)
+        h=wall_height(s,side)
+        # Keep the object at wall edge. This is cosmetic dressing only.
+        edge=side*max(.65,w-.13)
+        rng=random.Random(SEED*917+index*1051)
+        choice=noise(index,1003)
+        if choice<.16:  # weathered ladder against trench wall
+            top=min(h-.1,1.8)
+            a=world(s-.32,edge-side*.08,.025)
+            b=world(s-.32,edge+side*.015,top)
+            c=world(s+.32,edge-side*.08,.025)
+            d=world(s+.32,edge+side*.015,top)
+            beam_world(mesh,a,b,.034,16)
+            beam_world(mesh,c,d,.034,16)
+            for i in range(1,max(2,int(top/.26))):
+                y=i*.26
+                lateral=edge-side*.08+side*.095*(y/top)
+                beam_world(mesh,world(s-.32,lateral,y),world(s+.32,lateral,y),.025,15)
+        elif choice<.34:  # abandoned kit and small ammunition case
+            local_box(mesh,s,edge-side*.09,-.04,.38,.28,.28,15)
+            local_box(mesh,s,edge-side*.09,.24,.36,.29,.024,18)
+            # simple dark metal clasps
+            local_box(mesh,s+.16,edge-side*.10,.09,.025,.22,.11,10)
+        elif choice<.52:  # fallen split boards and stones
+            for k in range(3):
+                ss=s+(k-1)*.24
+                p=world(ss-.3,edge-side*.045,.045)
+                q=world(ss+.35,edge-side*(.06+.06*k),.11+.035*k)
+                beam_world(mesh,p,q,.030,15 if k%2 else 16)
+            for k in range(2):
+                ss=s+(k-.5)*.24
+                blob(mesh,world(ss,edge-side*.07,.05),(.12,.09,.15),17,10,4,k*.8)
+        elif choice<.69:  # rolled muddy tarp tucked against reinforcement
+            length=.7+.23*rng.random()
+            y=.47+.22*rng.random()
+            a=world(s-length*.5,edge,.02)
+            b=world(s+length*.5,edge,.02)
+            c=world(s+length*.49,edge-side*.02,y)
+            d=world(s-length*.48,edge-side*.02,y*.82)
+            mesh.quad(a,b,c,d,19,((0,0),(1.1,0),(1.1,.9),(0,.9)))
+            beam_world(mesh,world(s-length*.49,edge,y*.65),world(s+length*.49,edge,y*.65),.012,10)
+        elif choice<.83:  # battered small iron barrel / container
+            pos=world(s,edge-side*.1,.015)
+            top=(pos[0],pos[1]+.50,pos[2])
+            bar(mesh,pos,top,.16,10,14,.45)
+            for y in (.12,.38):
+                center=(pos[0],pos[1]+y,pos[2])
+                # bent bands approximate hoop, without expensive torus meshes
+                for j in range(12):
+                    t=j*math.tau/12;t2=(j+1)*math.tau/12
+                    a=(center[0]+.164*math.cos(t),center[1],center[2]+.164*math.sin(t))
+                    b=(center[0]+.164*math.cos(t2),center[1],center[2]+.164*math.sin(t2))
+                    bar(mesh,a,b,.012,10,5,.2)
+        else:  # bank-side sandbag roll and rope
+            for k in range(3):
+                ss=s+(k-1)*.30
+                p=world(ss,edge-side*.05,.13)
+                blob(mesh,p,(.21,.12,.20),19,12,5,k*.9)
+            a=world(s-.48,edge,.33)
+            b=world(s+.43,edge-side*.09,.25)
+            bar(mesh,a,b,.018,16,7,.28)
 
 def make_chunk(start):
     mesh=MeshBuilder()
@@ -849,6 +997,7 @@ def make_chunk(start):
     scenery_chunk(mesh,start)
     environment_chunk(mesh,start)
     draw_trench_obstacles(mesh,start)
+    trench_detail_props(mesh,start)
     return mesh.as_array()
 
 
@@ -1360,6 +1509,8 @@ class Trench:
         self.sky_prog=self.ctx.program(vertex_shader=SKYVERT,fragment_shader=SKYFRAG)
         self.sky_buffer=self.ctx.buffer(np.array([-1,-1,3,-1,-1,3],dtype='f4').tobytes())
         self.sky_vao=self.ctx.vertex_array(self.sky_prog,[(self.sky_buffer,'2f','xy')])
+        self.sky_prog['sun_direction'].value=SUN_DIRECTION
+        self.sky_prog['tan_half_fov'].value=math.tan(math.radians(CAMERA_VERTICAL_FOV)*.5)
         self.texture,self.normal_texture,self.has_pbr_normals=self.load_textures()
         self.prog['materials']=0
         self.prog['material_normals']=1
@@ -1389,36 +1540,62 @@ class Trench:
         self.last=time.monotonic();self.running=True
         self.frame_size=(W,H)
     def load_textures(self):
-        names=['clay.png','gravel.png','loam.png','humus.png','mud.png','bark.png','foliage.png','stone.png','timber.png','canvas.png','metal.png','flame.png','wet.png']
-        # Poly Haven originals are downloaded explicitly by fetch_polyhaven.py.
-        # Layer order stays unchanged: no geometry or save-file migration.
-        overrides={0:'brown_mud',1:'roots',2:'mud_forest',3:'mud_forest',4:'brown_mud_02'}
-        frames=[]; normals=[]; any_normals=False; loaded_colors=0; loaded_normals=0
-        for index,name in enumerate(names):
-            asset=overrides.get(index)
-            folder=ROOT/'assets'/'polyhaven'
-            color=folder/f'{asset}_diff.png' if asset else None
-            normal=folder/f'{asset}_nor_gl.png' if asset else None
-            source=color if color is not None and color.is_file() else ROOT/'assets'/name
-            if color is not None and source == color: loaded_colors += 1
+        # Texture-array layers are stable: the original first 13 retain their IDs.
+        # Extra DETAIL layers have local 1K fallback images in this delta.
+        base_names=['clay.png','gravel.png','loam.png','humus.png','mud.png',
+                    'bark.png','foliage.png','stone.png','timber.png','canvas.png',
+                    'metal.png','flame.png','wet.png']
+        detail_names=['pine_bark','bark_willow','wood_planks','wood_planks_grey',
+                      'mossy_rock','wood_planks_dirt','sandbag_mud']
+        # Earth originals from V1.9 + six NEW optional Poly Haven originals.
+        ph_overrides={0:'brown_mud',1:'roots',2:'mud_forest',3:'mud_forest',4:'brown_mud_02',
+                      13:'pine_bark',14:'bark_willow',15:'wood_planks',
+                      16:'wood_planks_grey',17:'mossy_rock',18:'wood_planks_dirt'}
+        ph_folder=ROOT/'assets'/'polyhaven'
+        detail_folder=ROOT/'assets'/'detail'
+        frames=[];normals=[];have_normals=False
+        loaded_color=0;loaded_normal=0;loaded_local_normals=0
+        blank_normal=bytes([128,128,255])*(TEXTURE_SIZE*TEXTURE_SIZE)
+        for index in range(20):
+            fallback=(ROOT/'assets'/base_names[index] if index<13 else
+                      detail_folder/(detail_names[index-13]+'.png'))
+            asset=ph_overrides.get(index)
+            color=ph_folder/(asset+'_diff.png') if asset else None
+            normal=ph_folder/(asset+'_nor_gl.png') if asset else None
+            source=color if color is not None and color.is_file() else fallback
+            if color is not None and source==color:loaded_color+=1
             with Image.open(source) as im:
-                frames.append(im.convert('RGB').resize((512,512),Image.BICUBIC).transpose(Image.FLIP_TOP_BOTTOM).tobytes())
-            if normal is not None and normal.is_file() and source==color:
-                with Image.open(normal) as im:
-                    normals.append(im.convert('RGB').resize((512,512),Image.BICUBIC).transpose(Image.FLIP_TOP_BOTTOM).tobytes())
-                any_normals=True; loaded_normals += 1
+                frames.append(im.convert('RGB').resize((TEXTURE_SIZE,TEXTURE_SIZE),Image.BICUBIC)
+                              .transpose(Image.FLIP_TOP_BOTTOM).tobytes())
+            chosen_normal=None
+            if normal is not None and source==color and normal.is_file():
+                chosen_normal=normal
+                loaded_normal+=1
+            elif index>=13 and source==fallback:
+                # Never pair a downloaded photographic albedo with an unrelated
+                # procedural fallback normal map.
+                local_n=detail_folder/(detail_names[index-13]+'_nor_gl.png')
+                if local_n.is_file():
+                    chosen_normal=local_n
+                    loaded_local_normals+=1
+            if chosen_normal is not None:
+                with Image.open(chosen_normal) as im:
+                    normals.append(im.convert('RGB').resize((TEXTURE_SIZE,TEXTURE_SIZE),Image.BICUBIC)
+                                   .transpose(Image.FLIP_TOP_BOTTOM).tobytes())
+                have_normals=True
             else:
-                normals.append(bytes([128,128,255])*(512*512))
-        tex=self.ctx.texture_array((512,512,len(frames)),3,data=b''.join(frames))
-        ntex=self.ctx.texture_array((512,512,len(normals)),3,data=b''.join(normals))
+                normals.append(blank_normal)
+        tex=self.ctx.texture_array((TEXTURE_SIZE,TEXTURE_SIZE,len(frames)),3,data=b''.join(frames))
+        ntex=self.ctx.texture_array((TEXTURE_SIZE,TEXTURE_SIZE,len(normals)),3,data=b''.join(normals))
         for item in (tex,ntex):
             item.repeat_x=True;item.repeat_y=True
             item.build_mipmaps()
             item.filter=(moderngl.LINEAR_MIPMAP_LINEAR,moderngl.LINEAR)
-            try:item.anisotropy=8.0
+            try:item.anisotropy=16.0
             except Exception:pass
-        print(f'Material: Poly Haven {loaded_colors}/5 color maps, {loaded_normals}/5 normal maps; missing files use built-in textures')
-        return tex,ntex,any_normals
+        print(f'Material: {TEXTURE_SIZE}px; Poly Haven {loaded_color} colors / {loaded_normal} normals; '
+              f'{loaded_local_normals} bundled detail normals; 20 layers total')
+        return tex,ntex,have_normals
 
     def chunk(self,index,data=None):
         if data is None:
@@ -1570,10 +1747,21 @@ class Trench:
         ww,hh=pygame.display.get_surface().get_size()
         self.ctx.viewport=(0,0,ww,hh)
         self.ctx.clear(.18,.23,.29,1.0,depth=1.0)
+        eye,aim=self.camera()
+        # Sun and sky have no translational parallax. Only orientation matters.
+        forward=np.asarray(aim,dtype='f4')-np.asarray(eye,dtype='f4')
+        forward/=max(1e-8,float(np.linalg.norm(forward)))
+        nominal_up=np.array((math.sin(self.camera_roll),math.cos(self.camera_roll),0.0),dtype='f4')
+        right=np.cross(forward,nominal_up)
+        right/=max(1e-8,float(np.linalg.norm(right)))
+        up=np.cross(right,forward)
+        self.sky_prog['sky_right'].value=tuple(float(v) for v in right)
+        self.sky_prog['sky_up'].value=tuple(float(v) for v in up)
+        self.sky_prog['sky_forward'].value=tuple(float(v) for v in forward)
+        self.sky_prog['view_aspect'].value=ww/hh
         self.ctx.disable(moderngl.DEPTH_TEST)
         self.sky_vao.render(moderngl.TRIANGLES)
         self.ctx.enable(moderngl.DEPTH_TEST)
-        eye,aim=self.camera()
         mat=perspective(CAMERA_VERTICAL_FOV,ww/hh,.045,FAR) @ view_from(eye,aim,self.camera_roll)
         self.prog['mvp'].write(mat.T.tobytes())
         self.prog['camera_position'].value=eye
@@ -1594,7 +1782,7 @@ class Trench:
                 if self.ui_timer>.3:
                     self.ui_timer=0
                     name=MOVES[self.mode][0]
-                    pygame.display.set_caption(f'3D SKYTTEGRAV V2.6 | {self.distance:06.0f} m | {self.brain.phase if self.auto else name} | {name} {self.speed:.1f} m/s | {self.fps:.0f} FPS | max {self.frame_max_ms:.0f}ms · upload {self.chunk_upload_ms:.0f}ms | 0 AUTO · F9/F10 FLYTTA · SPACE PAUS · R RESET · ESC AVSLUTA')
+                    pygame.display.set_caption(f'3D SKYTTEGRAV V2.7 | {self.distance:06.0f} m | {self.brain.phase if self.auto else name} | {name} {self.speed:.1f} m/s | {self.fps:.0f} FPS | max {self.frame_max_ms:.0f}ms · upload {self.chunk_upload_ms:.0f}ms | 0 AUTO · F9/F10 FLYTTA · SPACE PAUS · R RESET · ESC AVSLUTA')
                 pygame.time.wait(1)
         finally:
             for vbo,vao,_ in self.chunks.values():vao.release();vbo.release()
