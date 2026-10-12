@@ -22,7 +22,13 @@ except ImportError as exc:
     raise SystemExit(f"Missing dependency: {exc}. Install: python3 -m pip install pygame moderngl numpy pillow") from exc
 
 ROOT = Path(__file__).resolve().parent
-W, H = 960, 540  # Compact 16:9 standalone preview; Skjutbanan uses a configurable viewport.
+# Skjutbana defaults to 800x600 (4:3); the calibrated viewport can differ.
+# This is a standalone *window default*, not the physical camera calibration.
+W, H = 800, 600
+CAMERA_VERTICAL_FOV = 80.0  # Slightly wider vertical field, adjustable separately from window size.
+# Initial lift from desktop/window-manager placement; F9/F10 move in 12px steps.
+WINDOW_RAISE_PIXELS = 28
+OBSTACLE_SPACING = 13.0  # sparse, legible traversals without cluttering blind corners
 SEED = 1944
 SEGMENT = 1.0
 CHUNK_LEN = 80.0
@@ -483,6 +489,154 @@ def scene_at(s):
     return SCENES[(idx*5 + idx//3)%len(SCENES)]
 
 
+@dataclass(frozen=True)
+class TrenchObstacle:
+    """One seeded world object is shared by rendering and local navigation.
+
+    `detour` is a signed lateral target in route metres. A zero detour means
+    a step-over/cosmetic object; never misrepresent such a prop as a hard wall.
+    """
+    index: int
+    s: float
+    kind: str
+    lateral: float
+    length: float
+    width: float
+    height: float
+    detour: float = 0.0
+
+
+def trench_obstacle(index):
+    """Deterministic obstruction with measured walking clearance.
+
+    Skips junctions and actual Z/W turns. Never place an impassable crate in
+    a tight excavation; objects are not randomly teleported on chunk reload.
+    """
+    if index < 0:
+        return None
+    s = 15.0 + OBSTACLE_SPACING*index + (noise(index,401)-.5)*4.0
+    j=nearest_junction(s)
+    if j is not None and abs(j[0]-s)<9.0:
+        return None
+    near=int(round((s-BEND_FIRST)/BEND_SPACING))
+    if near >= 0 and abs(bend_marker(near)-s)<8.0:
+        return None
+    choice=noise(index,402)
+    kind=('crate' if choice<.26 else
+          'rubble' if choice<.48 else
+          'timber' if choice<.69 else
+          'sandbags' if choice<.84 else 'puddle')
+    lateral=(noise(index,403)-.5)*.17
+    if kind in ('crate','rubble'):
+        width=.54 if kind=='crate' else .62
+        length=.72 if kind=='crate' else .95
+        height=.58 if kind=='crate' else .42
+        # Eye/camera may follow either side if there is genuine lateral room.
+        # Account for changing width a few metres before and after obstacle.
+        clearance=.245
+        # Use the exact eye-position limits from SoldierBrain. We must not
+        # plan a detour the steering controller later clamps into the prop.
+        right_limit=min(cover_distance(s+d,1) for d in (-3.,-1.,0.,1.,3.))
+        left_limit=min(cover_distance(s+d,-1) for d in (-3.,-1.,0.,1.,3.))
+        right=lateral+width*.5+clearance
+        left=lateral-width*.5-clearance
+        possibilities=[]
+        if right<right_limit-.035: possibilities.append((right,right_limit-right))
+        if left>-left_limit+.035: possibilities.append((left,left_limit+left))
+        if not possibilities: return None
+        # Prefer the widest available lane, not necessarily the same side.
+        possibilities.sort(key=lambda option:option[1],reverse=True)
+        detour=possibilities[0][0]
+    else:
+        width=min(1.32,2*min(wall_width(s,1),wall_width(s,-1))-.36) if kind=='timber' else (.78 if kind=='sandbags' else .86)
+        length=.24 if kind=='timber' else (.70 if kind=='sandbags' else 1.30)
+        height=.22 if kind=='timber' else (.29 if kind=='sandbags' else .02)
+        detour=0.0
+    return TrenchObstacle(index,s,kind,lateral,length,width,height,detour)
+
+
+def obstacles_in_range(start, end):
+    """Stable lookup across GPU chunk boundaries and save/reload cycles."""
+    first=max(0,math.floor((start-17.0)/OBSTACLE_SPACING)-1)
+    last=max(0,math.ceil((end-13.0)/OBSTACLE_SPACING)+1)
+    result=[]
+    for i in range(first,last+1):
+        ob=trench_obstacle(i)
+        if ob is not None and start<=ob.s<=end:
+            result.append(ob)
+    return result
+
+
+def obstacle_steering(s):
+    """Smooth walk-around path, zero before and after each obstruction."""
+    offset=0.0
+    for ob in obstacles_in_range(s-4.0,s+4.0):
+        if not ob.detour:continue
+        d=s-ob.s
+        if -3.9<d<-1.0:
+            factor=eased((d+3.9)/2.9)
+        elif -1.0<=d<=1.0:
+            factor=1.0
+        elif 1.0<d<3.9:
+            factor=1.0-eased((d-1.0)/2.9)
+        else:factor=0.
+        offset+=ob.detour*factor
+    return offset
+
+
+def draw_trench_obstacles(mesh,start):
+    """Small reusable primitives; higher-quality GLB assets can replace them."""
+    for ob in obstacles_in_range(start,start+CHUNK_LEN-0.0001):
+        s,c=ob.s,ob.lateral
+        rng=random.Random(SEED*89+ob.index*113)
+        if ob.kind=='crate':
+            local_box(mesh,s,c,-.04,ob.length,ob.width,ob.height,9)
+            # Dark corner straps and raised edge rails make silhouette readable.
+            for ds in (-ob.length*.37,ob.length*.37):
+                local_box(mesh,s+ds,c,ob.height-.04,.055,ob.width+.025,.045,10)
+            for dc in (-ob.width*.37,ob.width*.37):
+                local_box(mesh,s,c+dc,ob.height-.04,ob.length,.040,.045,8)
+        elif ob.kind=='rubble':
+            for j in range(9):
+                ds=rng.uniform(-ob.length*.42,ob.length*.42)
+                dc=rng.uniform(-ob.width*.22,ob.width*.22)
+                r=rng.uniform(.095,.17)
+                p=world(s+ds,c+dc,r*.52)
+                blob(mesh,p,(r,r*.84,r*.82),7 if j%3 else 1,7,3,j+.3)
+            # A broken board poking out of the earth heap.
+            beam_world(mesh,world(s-.32,c-.13,.10),world(s+.18,c+.22,.38),.047,8)
+        elif ob.kind=='timber':
+            p=world(s,c-ob.width*.5,.13)
+            q=world(s,c+ob.width*.5,.13)
+            beam_world(mesh,p,q,.115,8)
+            beam_world(mesh,world(s+.27,c-ob.width*.25,.06),
+                       world(s-.26,c+ob.width*.30,.08),.045,8)
+        elif ob.kind=='sandbags':
+            for row in range(2):
+                for j in range(3-row):
+                    dc=(j-(2-row)/2)*.29
+                    center=world(s+(row-.5)*.15,c+dc,.11+row*.14)
+                    blob(mesh,center,(.23,.115,.19),9,9,3,rng.random()*10)
+        else:  # shallow water; no collision requirement
+            local_box(mesh,s,c,-.035,ob.length,ob.width,.015,12)
+    # Decorative, NON-colliding fragments stay close to the dirt wall. Their
+    # placement is independent of obstruction decisions / streaming order.
+    for index in range(int(start//11)-1,int((start+CHUNK_LEN)//11)+2):
+        if index<0:continue
+        ss=7.0+11.0*index+(noise(index,715)-.5)*3.0
+        if not start <= ss < start+CHUNK_LEN:continue
+        if near_junction(ss,5.0):continue
+        side=1 if noise(index,716)>.5 else -1
+        inset=max(.65,wall_width(ss,side)-.115)
+        lateral=side*inset
+        r=.10+.065*noise(index,717)
+        blob(mesh,world(ss,lateral,.035),(.14,r,.16),7,7,3,index*.17)
+        if noise(index,718)>.38:
+            a=world(ss-.32,lateral,.065)
+            b=world(ss+.48,lateral-side*.045,.082)
+            beam_world(mesh,a,b,.039,8)
+
+
 def box(mesh, center, dims, material, uv_scale=1.0):
     """Axis-aligned 3-D model prototype; real GLB props can replace later."""
     x,y,z=center;dx,dy,dz=(v*.5 for v in dims)
@@ -694,6 +848,7 @@ def make_chunk(start):
                    (mouth_width,sideheight),(mouth_width,-.04)))
     scenery_chunk(mesh,start)
     environment_chunk(mesh,start)
+    draw_trench_obstacles(mesh,start)
     return mesh.as_array()
 
 
@@ -772,6 +927,10 @@ class SoldierBrain:
         self.corner_cumulative=(0.0,)
         self.corner_points=()
         self.corner_outbound=True
+        self.obstacle_active=None
+        self.speed_factor=1.0
+        self.step_lift=0.0
+        self.gaze_pitch=0.0
 
     def reset(self):
         self.__init__()
@@ -886,6 +1045,9 @@ class SoldierBrain:
                 direction=bend_direction(k)
                 if abs(direction)>.42:
                     offset+=self._bend_cover(s,k,1 if direction>0 else -1)
+        # Reuse the same seeded obstacle target as the rendered geometry.
+        # Obstacle sites are kept outside bend/junction manoeuvre regions.
+        offset += obstacle_steering(s)
         if abs(offset)<1.e-9:
             return 0.0
         side=1 if offset>0 else -1
@@ -955,6 +1117,10 @@ class SoldierBrain:
     def choose(self,distance,dt):
         dt=max(0.,min(.08,dt))
         self._last_distance=distance
+        self.speed_factor=1.0
+        self.obstacle_active=None
+        self.step_lift=0.0
+        self.gaze_pitch=0.0
         # The soldier brain, not the renderer, decides how long each
         # preparation step lasts. The order is observable and testable.
         if self.state=='main':
@@ -964,7 +1130,8 @@ class SoldierBrain:
             for k in (first,first+1):
                 bm=bend_marker(k)
                 delta=bend_direction(k)
-                if (k not in self.checked_bends and abs(delta)>.42
+                if (k not in self.checked_bends and abs(delta)>.82
+                        and min(wall_height(bm,-1),wall_height(bm,1))>1.45
                         and bm-7.0<=distance<bm+1.0):
                     self.bend_index=k
                     self.bend_side=1 if delta>0 else -1
@@ -987,13 +1154,13 @@ class SoldierBrain:
             if self.wait==0.:
                 i=self.branch_index
                 if self.state=='bend_settle':
-                    self._start('bend_peek',.48+noise(self.bend_index,311)*.33,
+                    self._start('bend_peek',.30+noise(self.bend_index,311)*.19,
                                 'kikar försiktigt runt nytt hörn')
                 elif self.state=='bend_peek':
-                    self._start('bend_retract',.22+noise(self.bend_index,312)*.15,
+                    self._start('bend_retract',.15+noise(self.bend_index,312)*.13,
                                 'drar tillbaka huvudet')
                 elif self.state=='bend_retract':
-                    self._start('bend_assess',.26+noise(self.bend_index,313)*.29,
+                    self._start('bend_assess',.12+noise(self.bend_index,313)*.17,
                                 'bedömer passage')
                 elif self.state=='bend_assess':
                     self.checked_bends.add(self.bend_index)
@@ -1026,9 +1193,30 @@ class SoldierBrain:
         self._pose_for_state()
         self._tick_pose(dt)
         if self.state=='main':
+            # Look/slow down for an actual obstruction, not random idle scans.
+            nearby=obstacles_in_range(distance-1.5,distance+4.1)
+            ob=min(nearby,key=lambda obj:abs(obj.s-distance)) if nearby else None
+            if ob is not None and -1.5 <= ob.s-distance <= 4.1:
+                self.obstacle_active=ob
+                proximity=ob.s-distance
+                if ob.kind in ('crate','rubble'):
+                    self.speed_factor=.55 if proximity<2.1 else .78
+                    self.phase='går runt '+('låda' if ob.kind=='crate' else 'ras/bråte')
+                elif ob.kind=='puddle':
+                    self.speed_factor=.7
+                    self.phase='passerar vatten och lera'
+                else:
+                    self.speed_factor=.49 if proximity<1.3 else .70
+                    self.phase='kliver över '+('stock' if ob.kind=='timber' else 'sandsäckar')
+                    d=distance-ob.s
+                    if abs(d)<.72:
+                        # A single controlled rise/step, not a sudden teleport.
+                        self.step_lift=.078*math.sin(math.pi*eased((d+.72)/1.44))
+                    self.gaze_pitch=-.055*eased((4.1-proximity)/4.1)
+                return 5  # walk, not a crouch animation for every obstruction
             bend=abs(math.atan2(math.sin(route(distance+8)[2]-route(distance)[2]),
                                 math.cos(route(distance+8)[2]-route(distance)[2])))
-            self.phase='kontrollerar skarp sväng' if bend>.45 else 'avancerar'
+            self.phase='avancerar försiktigt' if bend>.45 else 'avancerar'
             return 4 if bend>.45 else (5 if bend>.17 else 7)
         if self.state in ('bend_approach','bend_settle','bend_peek','bend_retract','bend_assess'):
             return 4 if self.state=='bend_approach' else 1
@@ -1045,7 +1233,7 @@ class SoldierBrain:
         if self.state=='bend_approach':
             travel=min(movement,max(0.,self.bend_stop-distance))
             if distance+travel>=self.bend_stop-.015:
-                self._start('bend_settle',.25+noise(self.bend_index,310)*.25,
+                self._start('bend_settle',.12+noise(self.bend_index,310)*.15,
                             'stannar i skydd vid hörnet')
             return distance+travel,travel
         if self.state=='main':
@@ -1154,6 +1342,15 @@ class Trench:
         pygame.display.gl_set_attribute(pygame.GL_CONTEXT_PROFILE_MASK,pygame.GL_CONTEXT_PROFILE_CORE)
         pygame.display.gl_set_attribute(pygame.GL_DEPTH_SIZE,24)
         pygame.display.set_mode((W,H),pygame.OPENGL|pygame.DOUBLEBUF|pygame.RESIZABLE)
+        self._projector_window=None
+        try:
+            from pygame._sdl2.video import Window
+            self._projector_window=Window.from_display_module()
+            px,py=self._projector_window.position
+            self._projector_window.position=(px,py-WINDOW_RAISE_PIXELS)
+            print(f'Projektorfönster: flyttat {WINDOW_RAISE_PIXELS} px upp (F9/F10 justerar)')
+        except Exception as exc:
+            print(f'Projektorfönster: automatisk förflyttning stöds inte här ({exc}); dra manuellt')
         pygame.display.set_caption('Oändlig skyttegrav — riktig 3D / ModernGL')
         self.ctx=moderngl.create_context(require=330)
         self.ctx.enable(moderngl.DEPTH_TEST)
@@ -1187,6 +1384,7 @@ class Trench:
         self.gait_strength=0.0;self.last_moved=0.0
         self.gait_lateral=0.0;self.gait_vertical=0.0;self.gait_roll=0.0
         self.elapsed=0.;self.paused=False;self.fps=0.;self.ui_timer=0.
+        self.obstacle_camera_lift=0.0
         self.view_heading=None;self.last_dt=1/60;self.camera_roll=0.0
         self.last=time.monotonic();self.running=True
         self.frame_size=(W,H)
@@ -1195,19 +1393,20 @@ class Trench:
         # Poly Haven originals are downloaded explicitly by fetch_polyhaven.py.
         # Layer order stays unchanged: no geometry or save-file migration.
         overrides={0:'brown_mud',1:'roots',2:'mud_forest',3:'mud_forest',4:'brown_mud_02'}
-        frames=[]; normals=[]; any_normals=False
+        frames=[]; normals=[]; any_normals=False; loaded_colors=0; loaded_normals=0
         for index,name in enumerate(names):
             asset=overrides.get(index)
             folder=ROOT/'assets'/'polyhaven'
             color=folder/f'{asset}_diff.png' if asset else None
             normal=folder/f'{asset}_nor_gl.png' if asset else None
             source=color if color is not None and color.is_file() else ROOT/'assets'/name
+            if color is not None and source == color: loaded_colors += 1
             with Image.open(source) as im:
                 frames.append(im.convert('RGB').resize((512,512),Image.BICUBIC).transpose(Image.FLIP_TOP_BOTTOM).tobytes())
             if normal is not None and normal.is_file() and source==color:
                 with Image.open(normal) as im:
                     normals.append(im.convert('RGB').resize((512,512),Image.BICUBIC).transpose(Image.FLIP_TOP_BOTTOM).tobytes())
-                any_normals=True
+                any_normals=True; loaded_normals += 1
             else:
                 normals.append(bytes([128,128,255])*(512*512))
         tex=self.ctx.texture_array((512,512,len(frames)),3,data=b''.join(frames))
@@ -1218,7 +1417,7 @@ class Trench:
             item.filter=(moderngl.LINEAR_MIPMAP_LINEAR,moderngl.LINEAR)
             try:item.anisotropy=8.0
             except Exception:pass
-        print('Material: Poly Haven normal maps', 'enabled' if any_normals else 'not downloaded (original textures retained)')
+        print(f'Material: Poly Haven {loaded_colors}/5 color maps, {loaded_normals}/5 normal maps; missing files use built-in textures')
         return tex,ntex,any_normals
 
     def chunk(self,index,data=None):
@@ -1274,8 +1473,16 @@ class Trench:
                 self.frame_size=(max(400,event.w),max(260,event.h))
             if event.type!=pygame.KEYDOWN:continue
             if event.key==pygame.K_ESCAPE:self.running=False
+            elif event.key in (pygame.K_F9, pygame.K_F10):
+                if self._projector_window is not None:
+                    x,y=self._projector_window.position
+                    try:
+                        self._projector_window.position=(x,y+(-12 if event.key==pygame.K_F9 else 12))
+                    except Exception as exc:
+                        print(f'Kunde inte flytta fönstret: {exc}')
+                        self._projector_window=None
             elif event.key in (pygame.K_SPACE,pygame.K_p):self.paused=not self.paused
-            elif event.key==pygame.K_r:self.distance=0;self.elapsed=0;self.step_distance=0;self.speed=0;self.gait_strength=0;self.last_moved=0;self.gait_lateral=0;self.gait_vertical=0;self.gait_roll=0;self.brain.reset();self.view_heading=None
+            elif event.key==pygame.K_r:self.distance=0;self.elapsed=0;self.step_distance=0;self.speed=0;self.gait_strength=0;self.last_moved=0;self.gait_lateral=0;self.gait_vertical=0;self.gait_roll=0;self.brain.reset();self.view_heading=None;self.obstacle_camera_lift=0.0
             elif event.key==pygame.K_0:self.auto=True
             elif pygame.K_1<=event.key<=pygame.K_9:
                 self.auto=False;self.mode=event.key-pygame.K_1
@@ -1288,6 +1495,9 @@ class Trench:
         if self.auto:
             self.mode=self.brain.choose(self.distance,dt)
         name,target,height,stride=MOVES[self.mode]
+        # SoldierBrain plans tempo; render loop only follows the target speed.
+        if self.auto:
+            target *= self.brain.speed_factor
         self.speed=smooth(self.speed,target,1-math.exp(-dt*(1.25 if target>self.speed else 2.6)))
         advanced=self.speed*dt
         if self.auto:
@@ -1301,6 +1511,8 @@ class Trench:
                                   min(1., self.last_moved / max(0.0001,dt) / .75),
                                   1-math.exp(-dt*(7.0 if self.last_moved>0.0001 else 5.0)))
         self.height=smooth(self.height,height,1-math.exp(-dt*3.2))
+        lift=self.brain.step_lift if self.auto else 0.0
+        self.obstacle_camera_lift=smooth(self.obstacle_camera_lift,lift,1-math.exp(-dt*7.5))
 
     def camera(self):
         x,z,desired=self.brain.camera_pose(self.distance) if self.auto else route(self.distance)
@@ -1345,9 +1557,13 @@ class Trench:
         crouch=max(0.,min(1.,(1.42-self.height)/.40))
         x+=math.sin(heading)*.075*crouch
         z+=math.cos(heading)*.075*crouch
-        eye=(x,self.height+bob+breath,z)
+        eye=(x,self.height+bob+breath+self.obstacle_camera_lift,z)
         heading=heading+self.look+(self.brain.look_offset if self.auto else 0.)
-        aim=(x+math.sin(heading)*12,self.height-.085-.14*crouch,z+math.cos(heading)*12)
+        eye_y=eye[1]
+        pitch=self.brain.gaze_pitch if self.auto else 0.0
+        aim=(x+math.sin(heading)*12,
+             eye_y-.085-.14*crouch+math.tan(pitch)*12,
+             z+math.cos(heading)*12)
         return eye,aim
 
     def draw(self):
@@ -1358,7 +1574,7 @@ class Trench:
         self.sky_vao.render(moderngl.TRIANGLES)
         self.ctx.enable(moderngl.DEPTH_TEST)
         eye,aim=self.camera()
-        mat=perspective(74,ww/hh,.045,FAR) @ view_from(eye,aim,self.camera_roll)
+        mat=perspective(CAMERA_VERTICAL_FOV,ww/hh,.045,FAR) @ view_from(eye,aim,self.camera_roll)
         self.prog['mvp'].write(mat.T.tobytes())
         self.prog['camera_position'].value=eye
         self.texture.use(location=0)
@@ -1378,7 +1594,7 @@ class Trench:
                 if self.ui_timer>.3:
                     self.ui_timer=0
                     name=MOVES[self.mode][0]
-                    pygame.display.set_caption(f'3D SKYTTEGRAV V2.5 | {self.distance:06.0f} m | {self.brain.phase if self.auto else name} | {name} {self.speed:.1f} m/s | {self.fps:.0f} FPS | max {self.frame_max_ms:.0f}ms · upload {self.chunk_upload_ms:.0f}ms | 0 AUTO · 1–9 TEST · A/D TITTA · SPACE PAUS · R RESET · ESC AVSLUTA')
+                    pygame.display.set_caption(f'3D SKYTTEGRAV V2.6 | {self.distance:06.0f} m | {self.brain.phase if self.auto else name} | {name} {self.speed:.1f} m/s | {self.fps:.0f} FPS | max {self.frame_max_ms:.0f}ms · upload {self.chunk_upload_ms:.0f}ms | 0 AUTO · F9/F10 FLYTTA · SPACE PAUS · R RESET · ESC AVSLUTA')
                 pygame.time.wait(1)
         finally:
             for vbo,vao,_ in self.chunks.values():vao.release();vbo.release()

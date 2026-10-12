@@ -1,0 +1,46 @@
+{
+  "provider": "https://polyhaven.com/",
+  "license": "CC0",
+  "assets": {
+    "brown_mud": {
+      "diff": {
+        "source_url": "https://dl.polyhaven.org/file/ph-assets/Textures/png/1k/brown_mud/brown_mud_diff_1k.png",
+        "file": "brown_mud_diff.png"
+      },
+      "nor_gl": {
+        "source_url": "https://dl.polyhaven.org/file/ph-assets/Textures/png/1k/brown_mud/brown_mud_nor_gl_1k.png",
+        "file": "brown_mud_nor_gl.png"
+      }
+    },
+    "brown_mud_02": {
+      "diff": {
+        "source_url": "https://dl.polyhaven.org/file/ph-assets/Textures/png/1k/brown_mud_02/brown_mud_02_diff_1k.png",
+        "file": "brown_mud_02_diff.png"
+      },
+      "nor_gl": {
+        "source_url": "https://dl.polyhaven.org/file/ph-assets/Textures/png/1k/brown_mud_02/brown_mud_02_nor_gl_1k.png",
+        "file": "brown_mud_02_nor_gl.png"
+      }
+    },
+    "mud_forest": {
+      "diff": {
+        "source_url": "https://dl.polyhaven.org/file/ph-assets/Textures/png/1k/mud_forest/mud_forest_diff_1k.png",
+        "file": "mud_forest_diff.png"
+      },
+      "nor_gl": {
+        "source_url": "https://dl.polyhaven.org/file/ph-assets/Textures/png/1k/mud_forest/mud_forest_nor_gl_1k.png",
+        "file": "mud_forest_nor_gl.png"
+      }
+    },
+    "roots": {
+      "diff": {
+        "source_url": "https://dl.polyhaven.org/file/ph-assets/Textures/png/1k/roots/roots_diff_1k.png",
+        "file": "roots_diff.png"
+      },
+      "nor_gl": {
+        "source_url": "https://dl.polyhaven.org/file/ph-assets/Textures/png/1k/roots/roots_nor_gl_1k.png",
+        "file": "roots_nor_gl.png"
+      }
+    }
+  }
+}
