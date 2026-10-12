@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Editors
+.vscode/
+.idea/
+
+# Temporary files
+*.log
+*.tmp
+*~
+.DS_Store
+
+# Generated output
+screenshots/
+renders/
+cache/
