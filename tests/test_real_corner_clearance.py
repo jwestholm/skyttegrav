@@ -13,14 +13,17 @@ def real_brain():
     tree=ast.parse(path.read_text(encoding='utf-8'))
     names={'SoldierBrain','noise','eased','turn_for_meter','route',
            'wall_width','branch_center_shift','junction_marker','junction_side',
-           'branch_length','cover_distance','bend_marker','bend_direction'}
+           'branch_length','cover_distance','bend_marker','bend_direction',
+           'junction_kind','junction_sides','branch_type','branch_half_width'}
     body=[node for node in tree.body
           if isinstance(node,(ast.FunctionDef,ast.ClassDef)) and node.name in names]
     env={'math':math, 'SEED':1944, '_ROUTE':[(0.,0.,0.)],
          'WALL_HALF_WIDTH':1.12,'JUNCTION_FIRST':64,'JUNCTION_SPACING':72,
          'CORNER_DEPTH':1.5,'CORNER_MAIN_OFFSET':1.15,
          'BEND_FIRST':11,'BEND_SPACING':34,'COVER_EYE_CLEARANCE':.49,
-         'smooth':lambda a,b,alpha:a+(b-a)*alpha}
+         'smooth':lambda a,b,alpha:a+(b-a)*alpha,
+         'obstacle_steering':lambda s:0.0,'obstacles_in_range':lambda a,b:[],
+         'wall_height':lambda s,side:2.0}
     exec(compile(ast.Module(body=body,type_ignores=[]),str(path),'exec'),env)
     return env
 

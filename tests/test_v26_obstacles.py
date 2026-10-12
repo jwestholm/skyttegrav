@@ -19,12 +19,15 @@ def runtime_geometry():
     function_names={
         'smooth','noise','eased','turn_for_meter','route','wall_height','sides','world',
         'junction_marker','nearest_junction','junction','junction_side',
+        'junction_kind','junction_sides','branch_type','branch_half_width',
+        'lantern_side','nearby_lanterns','branch_point',
         'branch_length','branch_center_shift','cover_distance','bend_marker',
         'bend_direction','near_junction','landscape_type','wall_width',
         'wall_offset','surface_material','hill_y','world_on_ground',
         'obstacles_in_range','trench_obstacle','obstacle_steering',
         'draw_trench_obstacles','bar','blob','vec_normal','box','local_box',
         'beam_world','scene_at','scenery_chunk','environment_chunk','trench_detail_props','make_chunk',
+        'grass_tuft','rim_vegetation_chunk','trench_floor_litter','wood_crate',
     }
     class_names={'MeshBuilder','TrenchObstacle','SoldierBrain'}
     selected=[node for node in tree.body if isinstance(node,(ast.FunctionDef,ast.ClassDef))

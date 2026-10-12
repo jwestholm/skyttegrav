@@ -21,10 +21,14 @@ def load_brain():
         'junction_marker':lambda i:64+72*i,
         'junction_side':lambda i:1 if i%2 else -1,
         'branch_length':lambda i:12.,
+        'branch_type':lambda i:'dugout' if i%3==0 else 'open',
         'branch_center_shift':lambda i,d:.7,
         'route':lambda distance:(0.,float(distance),0.),
         'noise':lambda i,salt:((i*23+salt*37)%97)/97.,
         'smooth':lambda a,b,t:a+(b-a)*t,
+        'obstacles_in_range':lambda start,end:[],
+        'obstacle_steering':lambda s:0.0,
+        'wall_height':lambda s,side:2.0,
     }
     exec(compile(ast.Module(body=[node],type_ignores=[]),str(path),'exec'),env)
     return env['SoldierBrain']

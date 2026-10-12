@@ -26,8 +26,11 @@ ROOT = Path(__file__).resolve().parent
 # This is a standalone *window default*, not the physical camera calibration.
 W, H = 800, 600
 CAMERA_VERTICAL_FOV = 80.0  # Camera geometry remains independent of physical shooting distance.
-TEXTURE_SIZE = 1024  # Was 512; 2048 possible for GTX 1070 after profiling.
-SUN_DIRECTION = (0.35, 0.085, 0.93)  # Fixed celestial direction in WORLD coordinates.
+TEXTURE_SIZE = 1024  # Keep GTX 1070 streaming budget; extra detail via world-space blends.
+SUN_DIRECTION = (0.35, 0.085, 0.93)  # Stable world-space celestial direction.
+MOON_DIRECTION = (-0.38, 0.40, -0.69)
+FOG_DENSITY = 1.0  # Atmospheric haze; close-range aiming remains unobstructed.
+
 # Initial lift from desktop/window-manager placement; F9/F10 move in 12px steps.
 WINDOW_RAISE_PIXELS = 28
 OBSTACLE_SPACING = 13.0  # sparse, legible traversals without cluttering blind corners
@@ -35,7 +38,7 @@ SEED = 1944
 SEGMENT = 1.0
 CHUNK_LEN = 80.0
 JUNCTION_FIRST = 64
-JUNCTION_SPACING = 72
+JUNCTION_SPACING = 72  # For now all branching remains local; no global graph/A* yet.
 BRANCH_LENGTH = 12.0  # base length; individual dead ends vary
 CORNER_DEPTH = 1.50   # physical depth into branch reached by curved corner traversal
 CORNER_MAIN_OFFSET = 1.15  # metres before junction to start continuous bend
@@ -91,42 +94,88 @@ in vec3 v_world;
 uniform sampler2DArray materials;
 uniform sampler2DArray material_normals;
 uniform int use_pbr_normals;
+uniform int lamp_count;
+uniform vec3 lamp_positions[8];
+uniform float fog_strength;
 out vec4 f_color;
+
+// 20 = excavated earth, 21 = trench floor: shader-only material IDs.
+// They deliberately do NOT index the 20-layer texture array.
+float terrain_pattern(vec3 p) {
+    return 0.31*sin(p.x*1.75+p.z*0.87+0.63*sin(p.y*3.0))
+         + 0.28*cos(p.z*2.31-p.y*1.82+p.x*0.49)
+         + 0.23*sin(p.x*4.12+p.y*3.17-p.z*2.92)
+         + 0.11*cos(p.z*7.08+p.y*5.91);
+}
+vec3 sample_color(vec2 uv,int layer) {
+    return texture(materials,vec3(uv,float(layer))).rgb;
+}
 void main(){
     vec3 n=normalize(v_normal);
-    vec3 sun=normalize(vec3(0.35,0.16,0.93));
-    // Tangent-space normal mapping using world-position/UV derivatives.
-    // Only use it on earth layers, where surface UVs and derivatives are valid.
-    if (use_pbr_normals == 1 && v_layer >= 0 && v_layer <= 19) {
-        vec3 tangent_norm = texture(material_normals, vec3(v_uv, float(v_layer))).xyz * 2.0 - 1.0;
-        vec3 dp1=dFdx(v_world), dp2=dFdy(v_world);
-        vec2 duv1=dFdx(v_uv), duv2=dFdy(v_uv);
+    vec3 col;
+    vec2 uv=v_uv;
+    if (v_layer == 20) {
+        // Organic deposits measured in world space, NEVER 4 flat material bands.
+        // Smooth weights remain continuous at every chunk boundary and mesh edge.
+        float organic=terrain_pattern(v_world);
+        float rock=smoothstep(-.13,.49,organic + .13*sin(v_world.y*1.71+v_world.x*.93));
+        float clay=smoothstep(.06,.69,-organic + .17*cos(v_world.z*.71+v_world.y*2.16));
+        float humus=smoothstep(.23,.79,terrain_pattern(v_world*.63+vec3(3.2,1.7,0.7)));
+        col=mix(sample_color(uv,0),sample_color(uv*.87,1),rock*.68);
+        col=mix(col,sample_color(uv*1.17,2),clay*.60);
+        col=mix(col,sample_color(uv*.72,3),humus*.25);
+    } else if (v_layer == 21) {
+        // Real floor variation: damp mud, fine gravel and darker footprint zones.
+        float n1=terrain_pattern(v_world*vec3(.64,1.0,.64));
+        float n2=terrain_pattern(v_world*vec3(1.74,1.0,1.74)+vec3(6.,0.,2.));
+        float pebbles=smoothstep(-.10,.48,n1+n2*.30);
+        float wet=smoothstep(.13,.60,-n1+n2*.35);
+        col=mix(sample_color(uv,4),sample_color(uv*.84,1),pebbles*.58);
+        col=mix(col,sample_color(uv*1.13,12),wet*.41);
+    } else {
+        col=sample_color(uv,v_layer);
+    }
+    // Surface-detail normals are used on actual PBR-covered materials, not on
+    // procedural IDs (where the albedo is a multi-material blend).
+    if (use_pbr_normals == 1 && v_layer >= 0) {
+        // Organic wall and floor blends reuse the leading photographed normal.
+        int normal_layer = v_layer == 20 ? 0 : (v_layer == 21 ? 4 : v_layer);
+        vec3 tangent_norm=texture(material_normals,vec3(uv,float(normal_layer))).xyz*2.0-1.0;
+        vec3 dp1=dFdx(v_world),dp2=dFdy(v_world);
+        vec2 duv1=dFdx(uv),duv2=dFdy(uv);
         float determinant=duv1.x*duv2.y-duv1.y*duv2.x;
         if (abs(determinant)>0.000001) {
             vec3 t=normalize((dp1*duv2.y-dp2*duv1.y)/determinant);
             t=normalize(t-n*dot(n,t));
             vec3 b=normalize(cross(n,t))*sign(determinant);
-            n=normalize(mat3(t,b,n)*vec3(tangent_norm.xy*0.72,tangent_norm.z));
+            n=normalize(mat3(t,b,n)*vec3(tangent_norm.xy*.72,tangent_norm.z));
         }
     }
+    vec3 sun=normalize(vec3(0.35,0.085,0.93));
+    vec3 moon=normalize(vec3(-0.38,0.40,-0.69));
     float diffuse=max(dot(n,sun),0.0);
-    float brightness=0.58+0.50*diffuse;
-    // Subtle animated light from lamps, approximate until shadow-map pass.
-    float lantern=pow(max(0.0, sin(v_world.z*0.09+2.0)),12.0);
-    brightness += 0.09*lantern*max(0.0, 1.0-v_distance/15.0);
-    vec3 col=texture(materials,vec3(v_uv,float(v_layer))).rgb;
-    if (v_layer>=0 && v_layer<=3) {
-        float variation=sin(v_world.x*4.2+sin(v_world.y*7.1))*sin(v_world.z*3.7+v_world.y*5.3);
-        variation += 0.40*sin(v_world.z*1.5+v_world.y*12.2);
-        float grit=smoothstep(.25,1.05,variation)*.38;
-        col=mix(col,texture(materials,vec3(v_uv*1.27,1.0)).rgb,grit);
-    }
+    float moonlight=max(dot(n,moon),0.0);
+    // Dusk: muted ambient earth, directional sunlight and cool moon fill.
+    float brightness=.37 + .52*diffuse + .10*moonlight;
     col*=brightness;
-    col=pow(col,vec3(.93));
-    if (v_layer==11) col=vec3(1.0,.54,.16)*1.9; // lantern flame emission
-    if (v_layer==12) col=mix(col,vec3(.10,.07,.045),.4); // wet pools
-    float fog=1.0-exp(-pow(v_distance/170.0,2.0));
-    col=mix(col,vec3(.57,.51,.47),clamp(fog,0.,.87));
+    for (int i=0; i<8; i++) {
+        if(i>=lamp_count) break;
+        vec3 delta=lamp_positions[i]-v_world;
+        float r2=dot(delta,delta);
+        float nearLamp=pow(max(0.0,1.0-r2/42.25),2.0);
+        float facing=max(dot(n,normalize(delta)),0.0);
+        col+=vec3(.31,.19,.075)*nearLamp*(.23+.77*facing);
+    }
+    col=pow(max(col,vec3(0.0)),vec3(.96));
+    if (v_layer==11) col=vec3(1.0,.54,.16)*1.8;
+    if (v_layer==12) col=mix(col,vec3(.10,.07,.045),.4);
+    // Mist stays light in the trench and is denser over open ground.
+    float groundMist=smoothstep(.9,3.5,v_world.y);
+    float smoke=.5+.5*sin(v_world.x*.062+sin(v_world.z*.041)*1.9);
+    float distanceBeyond=max(0.0,v_distance-13.0);
+    float density=(.0053 + .012*groundMist + .0037*smoke)*fog_strength;
+    float fog=1.0-exp(-distanceBeyond*density);
+    col=mix(col,vec3(.38,.36,.36),clamp(fog,0.,.70));
     f_color=vec4(col,1.0);
 }
 '''
@@ -142,6 +191,7 @@ uniform vec3 sky_right;
 uniform vec3 sky_up;
 uniform vec3 sky_forward;
 uniform vec3 sun_direction;
+uniform vec3 moon_direction;
 uniform float tan_half_fov;
 uniform float view_aspect;
 void main(){
@@ -162,6 +212,13 @@ void main(){
     float glow=exp(-sun_angle*sun_angle/0.018);
     col+=vec3(.27,.13,.06)*glow;
     col=mix(col,vec3(.96,.69,.44),disc*.90);
+    vec3 moon=normalize(moon_direction);
+    float moonAngle=acos(clamp(dot(ray,moon),-1.0,1.0));
+    float moonDisc=1.0-smoothstep(.007,.011,moonAngle);
+    col=mix(col,vec3(.68,.74,.82),moonDisc*.70);
+    // Atmospheric distant clouds/haze stay fixed in WORLD viewing direction.
+    float haze=pow(1.0-smoothstep(-.015,.22,altitude),2.0);
+    col=mix(col,vec3(.36,.34,.35),.19*haze);
     // Dark earth backstop is only a last-resort mask for tiny geometry gaps.
     // Its boundary also follows world-space horizon, not screen UVs.
     vec3 soil=vec3(.095,.073,.055);
@@ -258,7 +315,37 @@ def junction(s):
 
 
 def junction_side(index):
+    # When both sides exist, the SoldierBrain selects one reproducibly.
     return 1 if noise(index,23)>.5 else -1
+
+
+def junction_kind(index):
+    """Local junction topology: one open continuation, T, Y or X.
+
+    'I' sections occur between junctions. This does not imply that side
+    branches yet connect into a globally navigable graph.
+    """
+    return ('T','Y','T','X','T','Y','X','T')[index % 8]
+
+
+def junction_sides(index):
+    return (-1,1) if junction_kind(index)=='X' else (junction_side(index),)
+
+
+def branch_type(index):
+    return 'dugout' if noise(index,1103)<.78 else 'open'
+
+
+def branch_half_width(index, along):
+    # Four-metre excavation at the mouth connects precisely to the wall cut.
+    # It narrows over the first 3m to a human-scale passage.
+    width=2.0 + (1.12-2.0)*eased(along/3.4)
+    # A little widening beneath the bank reads as an excavated dugout
+    # rather than a uniform pipe; main entrance and camera clearance stay safe.
+    if branch_type(index)=='dugout':
+        room_at=7.4 + 1.2*noise(index,1281)
+        width+=.28*math.exp(-((along-room_at)/2.15)**2)
+    return max(1.06, width + .035*math.sin(along*.8+index)*eased(along/2.0))
 
 
 def branch_length(index):
@@ -268,7 +355,8 @@ def branch_length(index):
 def branch_center_shift(index, along):
     # Small offset makes side tunnels bent rather than ruler-straight.
     progression=eased((along-3.0)/9.0)
-    return (noise(index,93)-.5)*2.0*progression
+    skew=(.32 if noise(index,1173)>.5 else -.32)*max(0.0,along-3.0) if junction_kind(index)=='Y' else 0.0
+    return (noise(index,93)-.5)*2.0*progression + skew
 
 
 def cover_distance(s, side):
@@ -298,6 +386,19 @@ def near_junction(s, radius=12.):
 
 class MeshBuilder:
     def __init__(self):self.vertices=[]
+    def smooth_quad(self,a,b,c,d,layer,uv,center,radii):
+        # Radial normals for curved foliage; original quad retains flat faces
+        # needed for trench planks, broken rocks and hard corners.
+        cx,cy,cz=center
+        rx,ry,rz=radii
+        for p,q,r,st in ((a,b,c,(uv[0],uv[1],uv[2])),(a,c,d,(uv[0],uv[2],uv[3]))):
+            for pos,tc in zip((p,q,r),st):
+                x,y,z=pos
+                normal=np.array(((x-cx)/(rx*rx),(y-cy)/(ry*ry),(z-cz)/(rz*rz)),dtype=float)
+                norm=np.linalg.norm(normal)
+                if norm<1e-5:normal=np.array((0.,1.,0.))
+                else:normal/=norm
+                self.vertices.extend((*pos,*normal,*tc,float(layer)))
     def quad(self,a,b,c,d,layer,uv):
         for p,q,r,st in ((a,b,c,(uv[0],uv[1],uv[2])),(a,c,d,(uv[0],uv[2],uv[3]))):
             normal=vec_normal(p,q,r)
@@ -435,9 +536,63 @@ def blob(mesh, center, radii, layer, segments=12, rows=5, phase=0.0):
         th0=math.pi*iy/rows;th1=math.pi*(iy+1)/rows
         for j in range(segments):
             f0=2*math.pi*j/segments;f1=2*math.pi*(j+1)/segments
-            mesh.quad(pt(th0,f0),pt(th1,f0),pt(th1,f1),pt(th0,f1),layer,
-                      ((j/segments,iy/rows),(j/segments,(iy+1)/rows),
-                       ((j+1)/segments,(iy+1)/rows),((j+1)/segments,iy/rows)))
+            uvs=((j/segments,iy/rows),(j/segments,(iy+1)/rows),
+                 ((j+1)/segments,(iy+1)/rows),((j+1)/segments,iy/rows))
+            if layer==6 and hasattr(mesh,'smooth_quad'):
+                mesh.smooth_quad(pt(th0,f0),pt(th1,f0),pt(th1,f1),pt(th0,f1),layer,uvs,center,radii)
+            else:
+                mesh.quad(pt(th0,f0),pt(th1,f0),pt(th1,f1),pt(th0,f1),layer,uvs)
+
+
+def grass_tuft(mesh, s, lateral, height, seed_index, size=1.0):
+    """A few tapered *3D* leaves at the trench lip (no transparency/alpha).
+
+    Strands use crossed vertical leaf triangles so silhouettes look organic.
+    Deterministic global spacing avoids chunk seam pops and reloading changes.
+    These are decorative, cannot obstruct the soldier or overwrite collision.
+    """
+    rng=random.Random(SEED*811+seed_index*1777)
+    cx,cy,cz=world(s,lateral,height)
+    count=rng.randint(8,15)
+    for i in range(count):
+        ang=2*math.pi*(i+.26*rng.random())/count
+        blade_height=(.075+.13*rng.random())*size
+        w=(.004+.009*rng.random())*size
+        lean=(.022+.07*rng.random())*size
+        ax,az=math.cos(ang),math.sin(ang)
+        bx,bz=-az,ax
+        base=(cx+ax*.028,cy,cz+az*.028)
+        p0=(base[0]+bx*w,base[1],base[2]+bz*w)
+        p1=(base[0]-bx*w,base[1],base[2]-bz*w)
+        tip=(base[0]+ax*lean,cy+blade_height,base[2]+az*lean)
+        # One triangle. Culling is disabled; the second degenerate triangle
+        # prevents double-sided foliage from becoming opaque rectangles.
+        mesh.quad(p0,p1,tip,tip,6,((0.,0.),(.8,0.),(.43,1.),(.43,1.)))
+
+
+def rim_vegetation_chunk(mesh, start):
+    """Mixed sparse clumps, rough stones and leaf litter on either bank rim.
+
+    Only a short world-distance interval is generated for each 80m chunk.
+    Fixed global indices make all objects stable on chunk eviction/rebuild.
+    """
+    first=max(0,math.floor((start-1.3)/2.6)-1)
+    last=math.ceil((start+CHUNK_LEN-1.3)/2.6)+1
+    for i in range(max(0,first),last+1):
+        s=1.3+2.6*i + .32*(noise(i,704)-.5)
+        if not start<=s<start+CHUNK_LEN or near_junction(s,4.5):continue
+        theme=scene_at(s)
+        for side in (-1,1):
+            # Some bare stretches preserve the war-torn appearance.
+            density=.78 if theme=='forest' else .62 if theme=='marsh' else .25 if theme=='rocky' else .43
+            if noise(i,720+side)>density:continue
+            off=side*(wall_width(s,side)+.17+.40*noise(i,730+side))
+            y=hill_y(s,side,off)
+            scale=.65+.80*noise(i,740+side)
+            grass_tuft(mesh,s,off,y-.015,i*5+side,scale)
+            if noise(i,750+side)>.68:
+                p=world(s+.19,off+side*.10,y+.015)
+                blob(mesh,p,(.13,.075,.11),17,12,5,i*.67)
 
 
 def scenery_chunk(mesh, start):
@@ -478,13 +633,13 @@ def scenery_chunk(mesh, start):
                                 ground[2]+math.sin(ang)*1.35*scale)
                     bar(mesh,(ground[0],yy,ground[2]),branch_end,.06*scale,13 if k else 14,9,.65)
                 blob(mesh,(top[0],top[1]-.55*scale,top[2]),
-                     (1.15*scale,1.48*scale,1.18*scale),6,14 if dist<12 else 9,6 if dist<12 else 4,rng.random()*7)
+                     (1.15*scale,1.48*scale,1.18*scale),6,20 if dist<12 else 11,8 if dist<12 else 5,rng.random()*7)
                 # detached clumps add asymmetry
                 for k in range(2):
                     ang=rng.uniform(-math.pi,math.pi)
                     d=rng.uniform(.5,1.3)*scale
                     blob(mesh,(top[0]+math.cos(ang)*d,top[1]-1.0*scale,
-                               top[2]+math.sin(ang)*d),(.76*scale,.78*scale,.78*scale),6,11 if dist<12 else 8,5 if dist<12 else 3,rng.random()*7)
+                               top[2]+math.sin(ang)*d),(.76*scale,.78*scale,.78*scale),6,16 if dist<12 else 9,7 if dist<12 else 4,rng.random()*7)
             elif choice<.51: # snapped and splintered trunk
                 height=rng.uniform(1.7,4.8)*scale
                 top=(ground[0]+rng.uniform(-.27,.27),ground[1]+height,ground[2]+rng.uniform(-.27,.27))
@@ -638,13 +793,35 @@ def obstacle_steering(s):
     return offset
 
 
+def wood_crate(mesh,s,lateral,y,length,width,height,weathered=15):
+    """Timber-box silhouette with individual planks, structural strips and straps.
+
+    Same bounding footprint as local_box -> existing SoldierBrain steering valid.
+    The geometry is decorative; this does NOT introduce unregistered blockers.
+    """
+    local_box(mesh,s,lateral,y,length,width,height,weathered)
+    # Raised slats on visible sides; very thin to keep silhouette legible.
+    for k in range(3):
+        h=y+.045+(k+.5)*(height-.09)/3.
+        for side in (-1,1):
+            # Outside side walls, parallel with the corridor.
+            local_box(mesh,s,lateral+side*(width*.5+.009),h,length*.96,.014,.024,18)
+        for end in (-1,1):
+            local_box(mesh,s+end*(length*.5+.008),lateral,h,.015,width*.91,.022,18)
+    # Corner braces darker than planking, making cube read as a crate.
+    for side in (-1,1):
+        for end in (-1,1):
+            local_box(mesh,s+end*length*.45,lateral+side*width*.45,y-.01,.040,.038,height+.03,13)
+    local_box(mesh,s,lateral,y+height-.025,length*.97,width*.97,.035,16)
+
+
 def draw_trench_obstacles(mesh,start):
     """Small reusable primitives; higher-quality GLB assets can replace them."""
     for ob in obstacles_in_range(start,start+CHUNK_LEN-0.0001):
         s,c=ob.s,ob.lateral
         rng=random.Random(SEED*89+ob.index*113)
         if ob.kind=='crate':
-            local_box(mesh,s,c,-.04,ob.length,ob.width,ob.height,15 if rng.random()<.6 else 16)
+            wood_crate(mesh,s,c,-.04,ob.length,ob.width,ob.height,15 if rng.random()<.6 else 18)
             # Dark corner straps and raised edge rails make silhouette readable.
             for ds in (-ob.length*.37,ob.length*.37):
                 local_box(mesh,s+ds,c,ob.height-.04,.055,ob.width+.025,.045,10)
@@ -718,6 +895,46 @@ def beam_world(mesh, a, b, thickness=.10, material=8):
     bar(mesh,a,b,thickness,material,facets=11 if thickness>=.06 else 7,repeat=.76)
 
 
+
+def lantern_side(k):
+    return 1 if noise(k,1882)>.5 else -1
+
+
+def branch_point(index, side, along, across=0.0, height=1.5):
+    """Shared geometric anchor for dugout decorations and nearby lights."""
+    marker=junction_marker(index)
+    x,z,h=route(marker)
+    near=max(wall_width(marker,side),wall_width(marker-2,side),
+             wall_width(marker+2,side))-.18
+    depth=near+along
+    shift=across+branch_center_shift(index,along)
+    return (x+side*math.cos(h)*depth+math.sin(h)*shift,
+            height,
+            z-side*math.sin(h)*depth+math.cos(h)*shift)
+
+
+def nearby_lanterns(s, radius=35.0):
+    """Exactly the same seeded lamps as the geometry; no global lamp cache."""
+    first=max(0,int(math.floor((s-radius-16)/37)))
+    last=int(math.ceil((s+radius-16)/37))+1
+    result=[]
+    for n in range(first,last+1):
+        k=16+n*37
+        if abs(k-s)>radius or scene_at(k)!='fortified': continue
+        side=lantern_side(k)
+        w=wall_width(k,side)
+        h=min(1.8,wall_height(k,side)-.1)
+        result.append(world(k,side*(w-.45),h-.18))
+    # Distant branches are not tracked. Only local, still-visible dugouts
+    # contribute a warm accent light around their entrance.
+    candidate=nearest_junction(s)
+    if candidate is not None and abs(candidate[0]-s)<radius:
+        i=int(candidate[1])
+        if branch_type(i)=='dugout':
+            for side in junction_sides(i):
+                result.append(branch_point(i,side,5.0,-.78,1.72))
+    return result[:8]
+
 def environment_chunk(mesh,start):
     """Rugged trench life: timber revetment, duckboards, sandbags, puddles,
     crates, lanterns, signs. All positioned in true world coordinates."""
@@ -756,18 +973,23 @@ def environment_chunk(mesh,start):
                 if theme=='forest' and noise(zone,914+side)>.78: continue
                 if style<.16:  # sometimes raw earth, not a corridor of endless rails
                     continue
-                if style<.68:  # hand-built horizontal timber, missing/uneven rails
-                    for j,jf in enumerate((.22,.44,.67,.85)):
-                        if noise(zone*17+j,850+side)<.13:continue
-                        sy=s-1.9; ey=s+1.9
+                if style<.72:  # tight split-log shoring alternating with open broken timber
+                    packed=style<.40
+                    tiers=9 if packed else 5
+                    for j in range(tiers):
+                        if not packed and noise(zone*17+j,850+side)<.16:continue
+                        jf=(j+.8)/(tiers+.8)
+                        sy=s-1.90; ey=s+1.90
                         hs=wall_height(sy,side);he=wall_height(ey,side)
-                        drift=(noise(zone*11+j,810)-.5)*.08
+                        drift=(noise(zone*11+j,810)-.5)*.035
                         ys=hs*(jf+drift);ye=he*(jf+drift)
-                        a=world(sy,side*(wall_offset(sy,side,ys,hs)-.09),ys)
-                        b=world(ey,side*(wall_offset(ey,side,ye,he)-.09),ye)
-                        tone=13 if noise(zone+j,812)<.32 else 14 if noise(zone+j,813)<.48 else 8
-                        beam_world(mesh,a,b,.079 if theme=='fortified' else .066,tone)
-                else:  # weathered plank shoring, with narrow irregular gaps
+                        a=world(sy,side*(wall_offset(sy,side,ys,hs)-.10),ys)
+                        b=world(ey,side*(wall_offset(ey,side,ye,he)-.10),ye)
+                        tone=(13 if noise(zone+j,812)<.40 else
+                              14 if noise(zone+j,813)<.47 else
+                              8 if noise(zone+j,814)<.62 else 15)
+                        beam_world(mesh,a,b,.103 if packed else .078,tone)
+                else:  # weathered vertical plank shoring, with narrow irregular gaps
                     for idx in range(5):
                         ss=s-1.65+idx*.78
                         hs=wall_height(ss,side)
@@ -788,7 +1010,7 @@ def environment_chunk(mesh,start):
                     base=world(s+(q-1)*.47,side*(wall_width(s,side)+.16),h+.11+r*.20)
                     blob(mesh,base,(.37,.16,.26),19,13,5,rng.random()*10)
         if theme=='fortified' and k%37==16:
-            side=-1 if rng.random()<.5 else 1
+            side=lantern_side(k)
             w=wall_width(s,side)
             h=min(1.8,wall_height(s,side)-.1)
             # lantern on an actual metal bracket, with emissive inner bulb
@@ -799,18 +1021,8 @@ def environment_chunk(mesh,start):
             box(mesh,base,(.18,.32,.17),10)
             flame=world(s,side*(w-.45),h-.18)
             blob(mesh,flame,(.07,.095,.066),11,9,4)
-    # Behind the trench: an intentionally subdued battlefield skyline.
-    # Visible only above the wall, built out of dark silhouettes.
-    for i in range(6):
-        s=start+6+i*12
-        theme=scene_at(s)
-        if theme not in ('ruined','fortified'): continue
-        side=-1 if rng.random()<.5 else 1
-        d=rng.uniform(11,29)
-        point=world_on_ground(s,side*d)
-        if i%2==0:
-            local_box(mesh,s,side*d,point[1],rng.uniform(1.5,3.0),1.4,rng.uniform(2,4.2),10)
-
+    # V2.8: remove bare grey box "buildings" from the skyline.
+    # A real ruin asset with windows/damage should replace these later.
 
 def trench_detail_props(mesh, start):
     """Bounded, seed-stable scene dressing close to bank, not artificial blockers.
@@ -838,14 +1050,14 @@ def trench_detail_props(mesh, start):
             b=world(s-.32,edge+side*.015,top)
             c=world(s+.32,edge-side*.08,.025)
             d=world(s+.32,edge+side*.015,top)
-            beam_world(mesh,a,b,.034,16)
-            beam_world(mesh,c,d,.034,16)
-            for i in range(1,max(2,int(top/.26))):
-                y=i*.26
+            beam_world(mesh,a,b,.042,13)
+            beam_world(mesh,c,d,.042,14)
+            for i in range(1,max(2,int(top/.32))):
+                y=i*.32
                 lateral=edge-side*.08+side*.095*(y/top)
-                beam_world(mesh,world(s-.32,lateral,y),world(s+.32,lateral,y),.025,15)
+                beam_world(mesh,world(s-.32,lateral,y),world(s+.32,lateral,y),.030,18)
         elif choice<.34:  # abandoned kit and small ammunition case
-            local_box(mesh,s,edge-side*.09,-.04,.38,.28,.28,15)
+            wood_crate(mesh,s,edge-side*.09,-.04,.38,.28,.28,15)
             local_box(mesh,s,edge-side*.09,.24,.36,.29,.024,18)
             # simple dark metal clasps
             local_box(mesh,s+.16,edge-side*.10,.09,.025,.22,.11,10)
@@ -888,6 +1100,18 @@ def trench_detail_props(mesh, start):
             b=world(s+.43,edge-side*.09,.25)
             bar(mesh,a,b,.018,16,7,.28)
 
+def trench_floor_litter(mesh, start):
+    """Tiny stones and compacted clumps, kept close to walls and off nav path."""
+    for i in range(max(0,int(start//3.3)-1),int((start+CHUNK_LEN)//3.3)+2):
+        s=1.15+i*3.3+.35*(noise(i,1802)-.5)
+        if not start<=s<start+CHUNK_LEN or near_junction(s,3.5):continue
+        side=-1 if noise(i,1803)>.5 else 1
+        offset=side*min(.88,wall_width(s,side)-.15)
+        if noise(i,1804)>.38:
+            r=.045+.06*noise(i,1805)
+            blob(mesh,world(s,offset,r*.52-.035),(r*1.45,r*.59,r),17,10,4,i*.47)
+
+
 def make_chunk(start):
     mesh=MeshBuilder()
     stride=SEGMENT
@@ -895,15 +1119,16 @@ def make_chunk(start):
         s0=start+i*stride;s1=s0+stride
         floor_half=1.95  # underlaps even the widest banks; prevents exposed ground seams
         mesh.quad(world(s0,-floor_half,-.045),world(s0,floor_half,-.045),
-                  world(s1,floor_half,-.045),world(s1,-floor_half,-.045),4,
+                  world(s1,floor_half,-.045),world(s1,-floor_half,-.045),21,
                   ((-floor_half,s0*.84),(floor_half,s0*.84),
                    (floor_half,s1*.84),(-floor_half,s1*.84)))
         for side in (-1,1):
             w0,w1=wall_width(s0,side),wall_width(s1,side)
             h0,h1=wall_height(s0,side),wall_height(s1,side)
             # Open the side wall where an actual T junction branches off.
-            crossing=junction((s0+s1)*.5)
-            cut=crossing is not None and crossing[1]==side
+            crossing=nearest_junction((s0+s1)*.5)
+            cut=(crossing is not None and abs((s0+s1)*.5-crossing[0])<2.0
+                 and side in junction_sides(crossing[1]))
             def layers(s,h):
                 # Non-parallel geological strata; vertical segmentation permits
                 # rough excavation faces instead of flat corridor slabs.
@@ -925,7 +1150,7 @@ def make_chunk(start):
                         p1=world(s0,side*wall_offset(s0,side,y01,h0),y01)
                         p2=world(s1,side*wall_offset(s1,side,y11,h1),y11)
                         p3=world(s1,side*wall_offset(s1,side,y10,h1),y10)
-                        mesh.quad(p0,p1,p2,p3,mat,
+                        mesh.quad(p0,p1,p2,p3,20,
                                   ((s0*1.12,y00*1.2),(s0*1.12,y01*1.2),
                                    (s1*1.12,y11*1.2),(s1*1.12,y10*1.2)))
             # Ground is a genuine continuous mesh tied to the lip. At a
@@ -950,54 +1175,120 @@ def make_chunk(start):
             lo,hi=world(s0,-min(.91,wall_width(s0,-1)-.1),.005),world(s0,min(.91,wall_width(s0,1)-.1),.005)
             lo2,hi2=world(s0+.16,-min(.91,wall_width(s0+.16,-1)-.1),.005),world(s0+.16,min(.91,wall_width(s0+.16,1)-.1),.005)
             mesh.quad(lo,hi,hi2,lo2,2,((0,0),(2.1,0),(2.1,.18),(0,.18)))
-    # Excavated T-junction side branches. Their mouths precisely match the
-    # four-metre wall gap (route marker +/- 2m). The branch floor is below the
-    # main floor, the upper landscape is cut out above it, and there is a real
-    # end wall: no unfinished geometry / distant slit to show the clear color.
+    # Seeded T/Y/X side passages. Cave roof and banks are real 3D surfaces;
+    # never draw a large rectangular room or an exposed square cutout.
     for marker in range(JUNCTION_FIRST, int(start+CHUNK_LEN)+1, JUNCTION_SPACING):
         if not start <= marker < start+CHUNK_LEN:
             continue
-        branch_side=1 if noise((marker-JUNCTION_FIRST)//JUNCTION_SPACING,23)>.5 else -1
+        branch_idx=(marker-JUNCTION_FIRST)//JUNCTION_SPACING
         x,z,h=route(marker)
         right=(math.cos(h),-math.sin(h))
         forward=(math.sin(h),math.cos(h))
-        sideheight=max(1.25, wall_height(marker, branch_side))
-        mouth_width=2.0  # same half width as wall cut
-        branch_idx=(marker-JUNCTION_FIRST)//JUNCTION_SPACING
         outer=float(branch_length(branch_idx))
-        near_edge=max(wall_width(marker,branch_side),wall_width(marker-2,branch_side),wall_width(marker+2,branch_side))-.18  # overlay by ~13 cm with main floor
-        def bp(along, across, height):
-            dist=near_edge+along
-            shifted=across+branch_center_shift(branch_idx,along)
-            return (x+branch_side*right[0]*dist+forward[0]*shifted,height,
-                    z+branch_side*right[1]*dist+forward[1]*shifted)
-        for n in range(int(outer)):
-            a=float(n);b=a+1.0
-            mesh.quad(bp(a,-mouth_width,-.048),bp(a,mouth_width,-.048),
-                      bp(b,mouth_width,-.048),bp(b,-mouth_width,-.048),4,
-                      ((a*.8,-mouth_width),(a*.8,mouth_width),
-                       (b*.8,mouth_width),(b*.8,-mouth_width)))
-            # Start side walls where the main trench lip ends. These mesh
-            # walls also close the exposed faces at the two mouth corners.
-            for flank in (-1,1):
-                ytop=sideheight + .08*math.sin(a*.33+flank)
-                ytop2=sideheight + .08*math.sin(b*.33+flank)
-                mesh.quad(bp(a,flank*mouth_width,-.04),
-                          bp(a,flank*mouth_width,ytop),
-                          bp(b,flank*mouth_width,ytop2),
-                          bp(b,flank*mouth_width,-.04),1,
-                          ((a,-.04),(a,ytop),(b,ytop2),(b,-.04)))
-        # Fully cap the side passage rather than leave an open sky-colored slit.
-        mesh.quad(bp(outer,-mouth_width,-.04),
-                  bp(outer,-mouth_width,sideheight),
-                  bp(outer,mouth_width,sideheight),
-                  bp(outer,mouth_width,-.04),1,
-                  ((-mouth_width,-.04),(-mouth_width,sideheight),
-                   (mouth_width,sideheight),(mouth_width,-.04)))
+        roofed=branch_type(branch_idx)=='dugout'
+        for branch_side in junction_sides(branch_idx):
+            sideheight=max(1.58,wall_height(marker,branch_side))
+            near_edge=max(wall_width(marker,branch_side),
+                          wall_width(marker-2,branch_side),
+                          wall_width(marker+2,branch_side))-.18
+            def bp(along, across, height):
+                dist=near_edge+along
+                shifted=across+branch_center_shift(branch_idx,along)
+                return (x+branch_side*right[0]*dist+forward[0]*shifted,height,
+                        z+branch_side*right[1]*dist+forward[1]*shifted)
+
+            def hw(along):return branch_half_width(branch_idx,along)
+            def shoulder(along):return 1.27+.08*math.sin(along*.47+branch_idx)
+            def crown(along):return max(1.94, min(2.22,sideheight+.30))+.07*math.sin(along*.51+branch_idx)
+            def vaulted(along,ratio):
+                # ratio:-1..+1. A broken irregular ellipse/cave arch.
+                r=max(-1.0,min(1.0,ratio))
+                return shoulder(along)+(crown(along)-shoulder(along))*pow(max(0.0,1.0-r*r),.62)
+
+            for n in range(int(outer)):
+                a=float(n);b=a+1.0
+                wa,wb=hw(a),hw(b)
+                mesh.quad(bp(a,-wa,-.052),bp(a,wa,-.052),
+                          bp(b,wb,-.052),bp(b,-wb,-.052),21,
+                          ((a*.81,-wa),(a*.81,wa),(b*.81,wb),(b*.81,-wb)))
+                # Narrow, irregular walls: not a box with four flat sides.
+                for flank in (-1,1):
+                    ya=shoulder(a) if roofed else sideheight+.08*math.sin(a*.3+flank)
+                    yb=shoulder(b) if roofed else sideheight+.08*math.sin(b*.3+flank)
+                    for j in range(4):
+                        t0=j/4.;t1=(j+1)/4.
+                        aa=wa+(.035*math.sin(a*.9+j*1.4+flank))*t0
+                        ab=wa+(.035*math.sin(a*.9+(j+1)*1.4+flank))*t1
+                        ba=wb+(.035*math.sin(b*.9+j*1.4+flank))*t0
+                        bb=wb+(.035*math.sin(b*.9+(j+1)*1.4+flank))*t1
+                        mesh.quad(bp(a,flank*aa,-.04+(ya+.04)*t0),
+                                  bp(a,flank*ab,-.04+(ya+.04)*t1),
+                                  bp(b,flank*bb,-.04+(yb+.04)*t1),
+                                  bp(b,flank*ba,-.04+(yb+.04)*t0),20,
+                                  ((a,t0*ya),(a,t1*ya),(b,t1*yb),(b,t0*yb)))
+                if roofed and n==5:
+                    # One enclosed, wall-mounted lantern and a tiny shelf.
+                    # Same location is passed to GPU lighting via nearby_lanterns.
+                    anchor=bp(a,-.78,1.68)
+                    bracket=bp(a,-.78,1.88)
+                    beam_world(mesh,anchor,bracket,.017,10)
+                    blob(mesh,bp(a,-.78,1.72),(.060,.090,.060),11,10,4)
+                    box(mesh,bp(a,-.78,1.59),(.19,.07,.20),10)
+                if roofed:
+                    # Curved vaulted roof: 10 subdivisions, with uneven timber
+                    # beams to suggest hand-excavated dugouts.
+                    for j in range(10):
+                        ra=-1.+2*j/10.; rb=-1.+2*(j+1)/10.
+                        # Wind inward normals toward the cave floor; an
+                        # excavated ceiling should not face the bright sun.
+                        mesh.quad(bp(a,wa*ra,vaulted(a,ra)),
+                                  bp(b,wb*ra,vaulted(b,ra)),
+                                  bp(b,wb*rb,vaulted(b,rb)),
+                                  bp(a,wa*rb,vaulted(a,rb)),20,
+                                  ((a,j*.24),(b,j*.24),
+                                   (b,(j+1)*.24),(a,(j+1)*.24)))
+                    if n in (1,4,7,10,13):
+                        # Posts and arch frame members follow roof, not a flat lid.
+                        for flank in (-1,1):
+                            top=bp(a,flank*wa,vaulted(a,flank))
+                            bottom=bp(a,flank*(wa-.045),0.0)
+                            beam_world(mesh,bottom,top,.065,13 if n%2 else 14)
+                        for j in range(6):
+                            ra=-1.+2*j/6.;rb=-1.+2*(j+1)/6.
+                            a1=bp(a,wa*ra,vaulted(a,ra)-.045)
+                            b1=bp(a,wa*rb,vaulted(a,rb)-.045)
+                            beam_world(mesh,a1,b1,.05,15 if n%2 else 13)
+                # A few seeded uneven floor boards inside buried sections.
+                if roofed and n%3==1 and n>2:
+                    width=max(.9,2*min(wa,wb)-.17)
+                    mesh.quad(bp(a,-width*.5,-.024),bp(a,width*.5,-.024),
+                              bp(a+.58,width*.5,-.024),bp(a+.58,-width*.5,-.024),15,
+                              ((0,0),(width,0),(width,.58),(0,.58)))
+            # The end is sealed by an arched cave face; no square end wall.
+            end_width=hw(outer)
+            if roofed:
+                for j in range(10):
+                    r0=-1.+2*j/10.;r1=-1.+2*(j+1)/10.
+                    y0=vaulted(outer,r0);y1=vaulted(outer,r1)
+                    mesh.quad(bp(outer,r0*end_width,-.04),
+                              bp(outer,r0*end_width,y0),
+                              bp(outer,r1*end_width,y1),
+                              bp(outer,r1*end_width,-.04),20,
+                              ((r0*end_width,0),(r0*end_width,y0),
+                               (r1*end_width,y1),(r1*end_width,0)))
+            else:
+                mesh.quad(bp(outer,-end_width,-.04),
+                          bp(outer,-end_width,sideheight),
+                          bp(outer,end_width,sideheight),
+                          bp(outer,end_width,-.04),20,
+                          ((-end_width,0),(-end_width,sideheight),
+                           (end_width,sideheight),(end_width,0)))
     scenery_chunk(mesh,start)
+    rim_vegetation_chunk(mesh,start)
     environment_chunk(mesh,start)
     draw_trench_obstacles(mesh,start)
     trench_detail_props(mesh,start)
+    trench_floor_litter(mesh,start)
     return mesh.as_array()
 
 
@@ -1087,6 +1378,9 @@ class SoldierBrain:
     def _depth_to_check(self,index):
         """Prototype estimate only: not physical visibility."""
         length=float(branch_length(index))
+        if branch_type(index)=='dugout':
+            # The end is hidden beneath an arch, so walking in briefly is sane.
+            return min(length-2.0, 3.9 + 2.4*noise(index,1179))
         bend=abs(branch_center_shift(index,length))
         if bend < .43:
             return 0.0 if noise(index,155)<.7 else max(CORNER_DEPTH+0.6,min(length-2.,1.3+noise(index,157)*1.8))
@@ -1510,11 +1804,19 @@ class Trench:
         self.sky_buffer=self.ctx.buffer(np.array([-1,-1,3,-1,-1,3],dtype='f4').tobytes())
         self.sky_vao=self.ctx.vertex_array(self.sky_prog,[(self.sky_buffer,'2f','xy')])
         self.sky_prog['sun_direction'].value=SUN_DIRECTION
+        self.sky_prog['moon_direction'].value=MOON_DIRECTION
         self.sky_prog['tan_half_fov'].value=math.tan(math.radians(CAMERA_VERTICAL_FOV)*.5)
         self.texture,self.normal_texture,self.has_pbr_normals=self.load_textures()
         self.prog['materials']=0
         self.prog['material_normals']=1
         self.prog['use_pbr_normals']=int(self.has_pbr_normals)
+        self.fog_strength=FOG_DENSITY
+        self.prog['fog_strength'].value=self.fog_strength
+        self.prog['lamp_count'].value=0
+        # Driver/ModernGL versions disagree on array uniform member names.
+        # Query the program once; never throw KeyError on the first draw call.
+        try:self.lamp_uniform=self.prog['lamp_positions']
+        except KeyError:self.lamp_uniform=self.prog['lamp_positions[0]']
         self.chunks={}
         self.todo=queue.Queue(maxsize=16)
         self.ready=queue.Queue(maxsize=16)
@@ -1658,6 +1960,12 @@ class Trench:
                     except Exception as exc:
                         print(f'Kunde inte flytta fönstret: {exc}')
                         self._projector_window=None
+            elif event.key==pygame.K_F7:
+                self.fog_strength=max(0.,self.fog_strength-.2)
+                print(f'Dimma: {self.fog_strength:.1f} (F7 mindre, F8 mer)')
+            elif event.key==pygame.K_F8:
+                self.fog_strength=min(3.,self.fog_strength+.2)
+                print(f'Dimma: {self.fog_strength:.1f} (F7 mindre, F8 mer)')
             elif event.key in (pygame.K_SPACE,pygame.K_p):self.paused=not self.paused
             elif event.key==pygame.K_r:self.distance=0;self.elapsed=0;self.step_distance=0;self.speed=0;self.gait_strength=0;self.last_moved=0;self.gait_lateral=0;self.gait_vertical=0;self.gait_roll=0;self.brain.reset();self.view_heading=None;self.obstacle_camera_lift=0.0
             elif event.key==pygame.K_0:self.auto=True
@@ -1765,6 +2073,13 @@ class Trench:
         mat=perspective(CAMERA_VERTICAL_FOV,ww/hh,.045,FAR) @ view_from(eye,aim,self.camera_roll)
         self.prog['mvp'].write(mat.T.tobytes())
         self.prog['camera_position'].value=eye
+        self.prog['fog_strength'].value=self.fog_strength
+        # Eight nearest deterministic lights; GPU only gets a bounded payload.
+        emitters=nearby_lanterns(self.distance,35.0)
+        self.prog['lamp_count'].value=len(emitters)
+        if emitters:
+            # ModernGL array members may be exposed via base name or [0].
+            self.lamp_uniform.write(np.asarray(emitters+[(0.,0.,0.)]*(8-len(emitters)),dtype='f4').tobytes())
         self.texture.use(location=0)
         self.normal_texture.use(location=1)
         for i in sorted(self.chunks):self.chunks[i][1].render()
@@ -1782,7 +2097,7 @@ class Trench:
                 if self.ui_timer>.3:
                     self.ui_timer=0
                     name=MOVES[self.mode][0]
-                    pygame.display.set_caption(f'3D SKYTTEGRAV V2.7 | {self.distance:06.0f} m | {self.brain.phase if self.auto else name} | {name} {self.speed:.1f} m/s | {self.fps:.0f} FPS | max {self.frame_max_ms:.0f}ms · upload {self.chunk_upload_ms:.0f}ms | 0 AUTO · F9/F10 FLYTTA · SPACE PAUS · R RESET · ESC AVSLUTA')
+                    pygame.display.set_caption(f'3D SKYTTEGRAV V2.9 | {self.distance:06.0f} m | {self.brain.phase if self.auto else name} | {name} {self.speed:.1f} m/s | {self.fps:.0f} FPS | max {self.frame_max_ms:.0f}ms · upload {self.chunk_upload_ms:.0f}ms | 0 AUTO · F9/F10 FLYTTA · SPACE PAUS · R RESET · ESC AVSLUTA')
                 pygame.time.wait(1)
         finally:
             for vbo,vao,_ in self.chunks.values():vao.release();vbo.release()
