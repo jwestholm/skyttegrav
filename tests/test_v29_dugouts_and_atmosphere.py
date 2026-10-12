@@ -37,10 +37,10 @@ class V29DugoutTests(unittest.TestCase):
             self.assertGreater(g['branch_half_width'](i,5),1.04)
         self.assertIn('def vaulted(along,ratio):',SRC)
         self.assertIn('for j in range(10):',SRC)
-        self.assertIn('max(1.94, min(2.22,sideheight+.30))',SRC)
+        self.assertIn('max(2.32, min(2.62,sideheight+.60))',SRC)
         self.assertIn('if roofed:',SRC)
         # Branch floor, wall, and ceiling remain distinct material areas.
-        self.assertIn('mesh.quad(bp(a,-wa,-.052)',SRC)
+        self.assertIn('mesh.quad(bp(a,-wa,fa-.004)',SRC)
         self.assertIn('mesh.quad(bp(a,wa*ra,vaulted(a,ra))',SRC)
         self.assertNotIn('mouth_width=2.0  # same half width as wall cut',SRC)
 

@@ -50,7 +50,7 @@ PREFETCH_AHEAD = 5
 RETAIN_BEHIND = 2
 UPLOADS_PER_FRAME = 1
 WALL_HALF_WIDTH = 1.12
-FAR = 260.0
+FAR = 290.0
 
 MOVES = [
     ('STÅR STILLA', 0.0, 1.55, 0.0),
@@ -132,6 +132,12 @@ void main(){
         float wet=smoothstep(.13,.60,-n1+n2*.35);
         col=mix(sample_color(uv,4),sample_color(uv*.84,1),pebbles*.58);
         col=mix(col,sample_color(uv*1.13,12),wet*.41);
+    } else if(v_layer==3) {
+        // World-spaced scorched earth islands between the original humus.
+        // These clusters align between streamed chunks (no repeating UVs).
+        float scattered=terrain_pattern(v_world*vec3(.23,1.0,.23));
+        float scorched=smoothstep(.31,.66,scattered)*.42;
+        col=mix(sample_color(uv,3),sample_color(uv*.88,12),scorched);
     } else {
         col=sample_color(uv,v_layer);
     }
@@ -169,13 +175,19 @@ void main(){
     col=pow(max(col,vec3(0.0)),vec3(.96));
     if (v_layer==11) col=vec3(1.0,.54,.16)*1.8;
     if (v_layer==12) col=mix(col,vec3(.10,.07,.045),.4);
-    // Mist stays light in the trench and is denser over open ground.
-    float groundMist=smoothstep(.9,3.5,v_world.y);
-    float smoke=.5+.5*sin(v_world.x*.062+sin(v_world.z*.041)*1.9);
-    float distanceBeyond=max(0.0,v_distance-13.0);
-    float density=(.0053 + .012*groundMist + .0037*smoke)*fog_strength;
-    float fog=1.0-exp(-distanceBeyond*density);
-    col=mix(col,vec3(.38,.36,.36),clamp(fog,0.,.70));
+    // Volumetric *approximation*: visible distant mist banks and drifting
+    // battlefield smoke patches. Near field (< 9m) remains clear for aiming.
+    float outside=smoothstep(1.0,3.1,v_world.y);
+    vec2 smokeCell=floor(v_world.xz/19.0);
+    float cluster=fract(sin(dot(smokeCell,vec2(12.9898,78.233)))*43758.5453);
+    float breeze=.5+.5*sin(v_world.x*.067+v_world.z*.043
+                          +sin(v_world.x*.027)*2.1);
+    float smoke=pow(max(0.0,breeze),2.0)*smoothstep(.43,.84,cluster);
+    float distant=max(0.0,v_distance-8.0);
+    float density=(.009 + .018*outside + .012*smoke)*fog_strength;
+    float fog=1.0-exp(-distant*density);
+    float mist_band=.14*outside*smoothstep(24.,65.,v_distance);
+    col=mix(col,vec3(.43,.42,.42),clamp(fog+mist_band,0.,.89));
     f_color=vec4(col,1.0);
 }
 '''
@@ -253,7 +265,17 @@ def turn_for_meter(s):
     pattern=(.87,-1.40,.87,-.82,1.34,-.82)
     magnitude=pattern[block%len(pattern)]*(.82+.27*noise(block,2))
     duration=9.0+noise(block,4)*7.0
-    return magnitude*(eased((s-start)/duration)-eased((s-start-1)/duration))
+    local=magnitude*(eased((s-start)/duration)-eased((s-start-1)/duration))
+    # Large-scale directional changes: longer east/west excursions instead
+    # of a world that always advances along Z. Compensating turns preserve
+    # broad route continuity without generating tight closed loops.
+    sweep=0.0
+    for begin,angle,span in ((155.,1.30,21.),(274.,-2.35,25.),
+                             (412.,1.05,24.)):
+        relative=(s%560.0)-begin
+        if -1.0<relative<span+1.0:
+            sweep+=angle*(eased((relative+1.0)/span)-eased(relative/span))
+    return local+sweep
 
 
 # Cache integer-metre centreline positions. Each step rotates smoothly.
@@ -458,16 +480,190 @@ def surface_material(s, side, height_fraction):
     if biome==1: return (0, 2, 3, 3)  # woodland humus
     return (1, 0, 2, 3)
 
+def tunnel_open(s):
+    """Roof envelope 0..1; deterministic world metres, no objects preloaded.
+
+    Each cut-through has an open portal, an underground middle and an exit.
+    Kept away from regular junction markers by selecting a broad period.
+    """
+    u=(max(0.0,float(s))-280.0) % 504.0
+    return eased((u-21.0)/5.0)*(1.0-eased((u-45.0)/5.0))
+
+
+def tunnel_drop(s):
+    """World-space ramp under an intact raised earth roof (metres)."""
+    u=(max(0.0,float(s))-280.0) % 504.0
+    return -0.72*eased((u-11.0)/12.0)*(1.0-eased((u-45.0)/12.0))
+
+
+def floor_y(s, lateral=0.0):
+    """Shared excavated floor height for GPU vertices and first-person eye.
+
+    Fine tread deformation fades towards the bank. No displacement seams at
+    neighbouring chunks or special doorway teleports.
+    """
+    margin=min(wall_width(s,-1),wall_width(s,1))
+    edge_factor=1.0-eased((abs(lateral)/max(.3,margin))*.95)
+    ruts=(.046*math.sin(s*.38+lateral*2.0)
+          +.024*math.cos(s*.91-lateral*3.6)
+          +.025*math.sin(s*.16+lateral*5.1))
+    return -.048 + tunnel_drop(s) + ruts*edge_factor
+
+
+def crater_height(s, offset):
+    """Local blast craters with a depressed bowl and raised ejected rim.
+
+    Crater sites are computed only from nearby indices, independent of chunk
+    loading or camera position. The trench itself stays unaffected.
+    """
+    if abs(offset)<5.0:return 0.0
+    result=0.0
+    first=max(0,int(s//24)-2)
+    for k in range(first,first+5):
+        center_s=11.0+24*k+7.0*(noise(k,360)-.5)
+        radius=2.4+3.4*noise(k,361)
+        side=-1 if noise(k,362)<.50 else 1
+        center_lateral=side*(7.+26.*noise(k,363))
+        dist=math.hypot(s-center_s,offset-center_lateral)
+        if dist>radius*1.65:continue
+        bowl=(1.0-eased(dist/radius))**1.3
+        lip=max(0.0,1.0-abs(dist/radius-1.12)/.35)
+        result+=-(.35+.62*noise(k,364))*bowl +(.12+.17*noise(k,365))*eased(lip)
+    return result
+
+
 def hill_y(s,side,offset):
-    # Real heightfield outside both trench edges, defined in world-space.
-    d=max(0,abs(offset)-wall_width(s,side))
-    base = wall_height(s, side) - .055
-    # Start exactly at the lip of the excavation; roll gently into broad hills.
-    roll = 1.0 - math.exp(-d / 8.0)
-    return (base + roll * (
-        0.22 * math.sin(s * .046 + side * .8 + offset * .085)
-        + 0.32 * math.sin(offset * .073 + s * .028)
-        + 0.12 * math.sin(s * .12 + offset * .17)))
+    # Same deterministic terrain for meshes and all exterior scenery.
+    d=max(0.,abs(offset)-wall_width(s,side))
+    base=wall_height(s,side)-.055
+    roll=1.0-math.exp(-d/8.0)
+    # Mid- and long-distance slopes are substantial enough to silhouette
+    # behind the trees, instead of a flat world terminating after 60m.
+    hills=(.34*math.sin(s*.027+side*.8+offset*.045)
+           +.60*math.sin(offset*.026+s*.018)
+           +.24*math.sin(s*.083+offset*.064))
+    far_rise=eased((d-12.0)/55.0)*(.35+.82*math.sin(s*.012+offset*.013)**2)
+    crater=crater_height(s,offset)*eased((d-1.0)/3.0)
+    return base+roll*hills+far_rise+crater
+
+
+def _cutout_polygon_intersects_ground(patch, footprint):
+    """2D SAT overlap for convex X/Z ground patches and cutout footprints.
+
+    Vertex/centroid-only sampling fails when a long ground strip *crosses*
+    a narrow buried tunnel without containing a sampled vertex. This test
+    examines edges of BOTH polygons, including near-parallel intersections.
+    """
+    for polygon in (patch, footprint):
+        for idx, (ax, az) in enumerate(polygon):
+            bx, bz = polygon[(idx + 1) % len(polygon)]
+            nx, nz = az - bz, bx - ax
+            if nx * nx + nz * nz < 1e-12:
+                continue
+            pvals = [x * nx + z * nz for x, z in patch]
+            fvals = [x * nx + z * nz for x, z in footprint]
+            if max(pvals) < min(fvals) - 1e-7 or max(fvals) < min(pvals) - 1e-7:
+                return False
+    return True
+
+
+def _branch_footprint(i, side, cx, cz, right, forward, near, along, margin=.06):
+    """One swept quad of an excavated side passage, in world X/Z."""
+    def edge(d, flank):
+        w=branch_half_width(i,d)+margin
+        shift=branch_center_shift(i,d)
+        return (cx + side*right[0]*(near+d) + forward[0]*(shift+flank*w),
+                cz + side*right[1]*(near+d) + forward[1]*(shift+flank*w))
+    a,b=along
+    return (edge(a,-1),edge(a,1),edge(b,1),edge(b,-1))
+
+
+def _main_route_footprint(a,b,margin=-.15):
+    """A navigable cross-section, projected in world X/Z, not route offsets."""
+    def point(s,side):
+        y=wall_height(s,side)
+        edge=max(.35,wall_offset(s,side,y,y)+margin)
+        x,z=sides(s,side*edge)
+        return (x,z)
+    return (point(a,-1),point(a,1),point(b,1),point(b,-1))
+
+
+def _main_tunnel_footprint(a,b):
+    """Roof cuts slightly OUTSIDE the lip, unlike open bank cutouts."""
+    return _main_route_footprint(a,b,.10)
+
+
+def world_excavation_masks(start):
+    """Bounded X/Z spatial hash of actual trench/dugout excavation areas.
+
+    WHY: The old outdoor terrain was generated as up to 145m-long *normal*
+    offsets from a bending centreline. Those world-space polygons can fold
+    BACK OVER THE TRENCH even hundreds of metres away from their source!
+    Protect the whole 3D trench with spatial cutouts, not just its roofs.
+
+    Build each chunk's nearby footprints from the deterministic seed. Spatial
+    cells keep triangle queries economical despite the longer routes.
+    """
+    grid=16.0
+    masks={}
+    def add(poly):
+        xs=[v[0] for v in poly];zs=[v[1] for v in poly]
+        x0,x1,z0,z1=min(xs),max(xs),min(zs),max(zs)
+        item=(x0,x1,z0,z1,poly)
+        for ix in range(math.floor(x0/grid),math.floor(x1/grid)+1):
+            for iz in range(math.floor(z0/grid),math.floor(z1/grid)+1):
+                masks.setdefault((ix,iz),[]).append(item)
+    # Wide world terrain triangles can project across much earlier/later s.
+    # The stream remains bounded; extra length affects only cheap 2D masks.
+    reach=CHUNK_LEN*4
+    first=max(0,math.floor((start-reach-JUNCTION_FIRST)/JUNCTION_SPACING))
+    last=max(first,math.ceil((start+CHUNK_LEN+reach-JUNCTION_FIRST)/JUNCTION_SPACING))
+    for i in range(first,last+1):
+        marker=junction_marker(i)
+        cx,cz,h=route(marker)
+        right=(math.cos(h),-math.sin(h))
+        forward=(math.sin(h),math.cos(h))
+        for side in junction_sides(i):
+            near=max(wall_width(marker,side),wall_width(marker-2,side),
+                     wall_width(marker+2,side))-.18
+            length=branch_length(i)
+            for k in range(math.ceil(length/.75)):
+                a=k*.75;b=min(length,(k+1)*.75)
+                add(_branch_footprint(i,side,cx,cz,right,forward,near,(a,b)))
+    first_k=max(0,int(start-reach))
+    last_k=int(start+CHUNK_LEN+reach)
+    for k in range(first_k,last_k):
+        a,b=float(k),float(k+1)
+        is_roofed=max(tunnel_open(a+.25),tunnel_open(a+.75))>.001
+        add(_main_tunnel_footprint(a,b) if is_roofed else
+            _main_route_footprint(a,b))
+    return masks
+
+
+def ground_patch_intersects_excavation(patch,masks):
+    """Exact 2D edge overlap, indexed by coarse world-space hash cells."""
+    xs=[p[0] for p in patch];zs=[p[1] for p in patch]
+    lo_x,hi_x,lo_z,hi_z=min(xs),max(xs),min(zs),max(zs)
+    grid=16.0
+    seen=set()
+    for ix in range(math.floor(lo_x/grid),math.floor(hi_x/grid)+1):
+        for iz in range(math.floor(lo_z/grid),math.floor(hi_z/grid)+1):
+            for item in masks.get((ix,iz),()):
+                if id(item) in seen:continue
+                seen.add(id(item))
+                x0,x1,z0,z1,footprint=item
+                if x1<lo_x-1e-7 or x0>hi_x+1e-7 or z1<lo_z-1e-7 or z0>hi_z+1e-7:
+                    continue
+                if _cutout_polygon_intersects_ground(patch,footprint):
+                    return True
+    return False
+
+
+def soil_over_excavation(x,z,masks):
+    """Compatibility diagnostic: whether a point lies inside an X/Z cutout."""
+    p=((x-.0001,z-.0001),(x+.0001,z-.0001),
+       (x+.0001,z+.0001),(x-.0001,z+.0001))
+    return ground_patch_intersects_excavation(p,masks)
 
 
 # --- V1.5 deterministic outdoor scenery, no separate game engine ---
@@ -689,6 +885,57 @@ def scenery_chunk(mesh, start):
                     bar(mesh,middle,end,.013,7,3,.25)
 
 
+def battlefield_debris_chunk(mesh,start):
+    """Clusters of destroyed field debris and shattered trees.
+
+    A small fixed set of local mesh instances is recreated from global seed
+    positions; nothing grows with distance travelled. Keep the same authentic
+    tree distribution in scenery_chunk (requested as a KNOWN GOOD).
+    """
+    first=max(0,int(math.floor((start-3.0)/7.2))-1)
+    last=int(math.ceil((start+CHUNK_LEN-3.0)/7.2))+2
+    for i in range(first,last):
+        center_s=3.0+7.2*i+2.1*(noise(i,4001)-.5)
+        if not start<=center_s<start+CHUNK_LEN:continue
+        if near_junction(center_s,6.0):continue
+        theme=scene_at(center_s)
+        density={'forest':.50,'ruined':.96,'rocky':.70,'exposed':.66,
+                 'fortified':.49,'marsh':.67}[theme]
+        if noise(i,4002)>density:continue
+        side=-1 if noise(i,4003)<.5 else 1
+        rng=random.Random(SEED*3101+i*8309)
+        anchor_offset=side*(5.+29.*noise(i,4004))
+        # Larger fragmented patches; no repeating two straight rows.
+        fragments=2+int(noise(i,4005)*5)
+        for j in range(fragments):
+            s=center_s+rng.uniform(-2.4,2.4)
+            off=anchor_offset+rng.uniform(-3.7,3.7)
+            # Offscreen/outside current generation interval => next chunk
+            # regenerates a local half independently. Avoid renderer popping.
+            if not start<=s<start+CHUNK_LEN or abs(off)<3.0:continue
+            point=world_on_ground(s,off)
+            kind=rng.random()
+            if kind<.36:
+                r=.16+.52*rng.random()
+                blob(mesh,(point[0],point[1]+r*.32,point[2]),
+                     (r*1.25,r*.65,r*.90),17 if kind<.19 else 7,
+                     12 if abs(off)<22 else 8,5,math.tau*rng.random())
+            elif kind<.73:
+                # Scattered snapped splinters / collapsed supports.
+                length=.6+2.3*rng.random()
+                end=(point[0]+rng.uniform(-1,1)*length,
+                     point[1]+rng.uniform(.07,.27),
+                     point[2]+rng.uniform(-1,1)*length)
+                beam_world(mesh,(point[0],point[1]+.06,point[2]),end,
+                           .035+.085*rng.random(),13 if rng.random()<.46 else 14)
+            else:
+                # Torn sandbag groups and mud clods. No floating spheres.
+                for k in range(rng.randrange(1,4)):
+                    o=(point[0]+rng.uniform(-.28,.28),point[1]+.08,
+                       point[2]+rng.uniform(-.28,.28))
+                    blob(mesh,o,(.21,.11,.26),19,10,4,rng.random()*5)
+
+
 # --- V1.7 scenic construction, determined by route metres rather than frames ---
 # Themes are deliberately long stretches so the world reads as places, not random props.
 SCENES = ('fortified', 'exposed', 'ruined', 'marsh', 'forest', 'rocky')
@@ -724,6 +971,8 @@ def trench_obstacle(index):
     if index < 0:
         return None
     s = 15.0 + OBSTACLE_SPACING*index + (noise(index,401)-.5)*4.0
+    if tunnel_drop(s)<-.10:
+        return None  # avoid unseen raised obstacles inside sloping tunnel
     j=nearest_junction(s)
     if j is not None and abs(j[0]-s)<9.0:
         return None
@@ -737,9 +986,15 @@ def trench_obstacle(index):
           'sandbags' if choice<.84 else 'puddle')
     lateral=(noise(index,403)-.5)*.17
     if kind in ('crate','rubble'):
-        width=.54 if kind=='crate' else .62
-        length=.72 if kind=='crate' else .95
-        height=.58 if kind=='crate' else .42
+        large=kind=='crate' and noise(index,450)>.73
+        width=(.73 if large else .54) if kind=='crate' else .62
+        length=(1.16 if large else .72) if kind=='crate' else .95
+        height=(1.13 if large else .58) if kind=='crate' else .42
+        if large:
+            # Half-cover crate to one side, leaving a verified escape lane.
+            wall_side=1 if noise(index,451)>.5 else -1
+            available=min(wall_width(s+d,wall_side) for d in (-1.,0.,1.))
+            lateral=wall_side*(available-width*.5-.075)
         # Eye/camera may follow either side if there is genuine lateral room.
         # Account for changing width a few metres before and after obstacle.
         clearance=.245
@@ -821,35 +1076,37 @@ def draw_trench_obstacles(mesh,start):
         s,c=ob.s,ob.lateral
         rng=random.Random(SEED*89+ob.index*113)
         if ob.kind=='crate':
-            wood_crate(mesh,s,c,-.04,ob.length,ob.width,ob.height,15 if rng.random()<.6 else 18)
+            wood_crate(mesh,s,c,floor_y(s,c)-.04,ob.length,ob.width,ob.height,
+                       15 if rng.random()<.6 else 18)
             # Dark corner straps and raised edge rails make silhouette readable.
             for ds in (-ob.length*.37,ob.length*.37):
-                local_box(mesh,s+ds,c,ob.height-.04,.055,ob.width+.025,.045,10)
+                local_box(mesh,s+ds,c,floor_y(s,c)+ob.height-.04,.055,ob.width+.025,.045,10)
             for dc in (-ob.width*.37,ob.width*.37):
-                local_box(mesh,s,c+dc,ob.height-.04,ob.length,.040,.045,8)
+                local_box(mesh,s,c+dc,floor_y(s,c)+ob.height-.04,ob.length,.040,.045,8)
         elif ob.kind=='rubble':
             for j in range(9):
                 ds=rng.uniform(-ob.length*.42,ob.length*.42)
                 dc=rng.uniform(-ob.width*.22,ob.width*.22)
                 r=rng.uniform(.095,.17)
-                p=world(s+ds,c+dc,r*.52)
+                p=world(s+ds,c+dc,floor_y(s+ds,c+dc)+r*.52)
                 blob(mesh,p,(r,r*.84,r*.82),17 if j%3 else 1,12,5,j+.3)
             # A broken board poking out of the earth heap.
-            beam_world(mesh,world(s-.32,c-.13,.10),world(s+.18,c+.22,.38),.047,8)
+            beam_world(mesh,world(s-.32,c-.13,floor_y(s-.32,c-.13)+.10),
+                       world(s+.18,c+.22,floor_y(s+.18,c+.22)+.38),.047,8)
         elif ob.kind=='timber':
-            p=world(s,c-ob.width*.5,.13)
-            q=world(s,c+ob.width*.5,.13)
+            p=world(s,c-ob.width*.5,floor_y(s,c-ob.width*.5)+.13)
+            q=world(s,c+ob.width*.5,floor_y(s,c+ob.width*.5)+.13)
             beam_world(mesh,p,q,.115,8)
-            beam_world(mesh,world(s+.27,c-ob.width*.25,.06),
-                       world(s-.26,c+ob.width*.30,.08),.045,8)
+            beam_world(mesh,world(s+.27,c-ob.width*.25,floor_y(s+.27,c)+.06),
+                       world(s-.26,c+ob.width*.30,floor_y(s-.26,c)+.08),.045,8)
         elif ob.kind=='sandbags':
             for row in range(2):
                 for j in range(3-row):
                     dc=(j-(2-row)/2)*.29
-                    center=world(s+(row-.5)*.15,c+dc,.11+row*.14)
+                    center=world(s+(row-.5)*.15,c+dc,floor_y(s,c+dc)+.11+row*.14)
                     blob(mesh,center,(.23,.115,.19),19,13,5,rng.random()*10)
         else:  # shallow water; no collision requirement
-            local_box(mesh,s,c,-.035,ob.length,ob.width,.015,12)
+            local_box(mesh,s,c,floor_y(s,c)+.005,ob.length,ob.width,.010,12)
     # Decorative, NON-colliding fragments stay close to the dirt wall. Their
     # placement is independent of obstruction decisions / streaming order.
     for index in range(int(start//11)-1,int((start+CHUNK_LEN)//11)+2):
@@ -896,6 +1153,95 @@ def beam_world(mesh, a, b, thickness=.10, material=8):
 
 
 
+def oil_lantern(mesh, flame, scale=1.0):
+    """Small framed oil hurricane lantern, not a glowing sphere.
+
+    The warm point light uses this *same* flame position. Transparent glass
+    is intentionally avoided until we have correct alpha depth sorting.
+    """
+    cx,cy,cz=flame
+    unit=.075*scale
+    # Basal kerosene reservoir and raised hinged cap.
+    blob(mesh,(cx,cy-.12*scale,cz),(.082*scale,.060*scale,.077*scale),10,12,4)
+    bar(mesh,(cx,cy-.11*scale,cz),(cx,cy+.12*scale,cz),.014*scale,10,8)
+    blob(mesh,(cx,cy+.122*scale,cz),(.069*scale,.030*scale,.069*scale),10,12,3)
+    blob(mesh,(cx,cy,cz),(.038*scale,.066*scale,.041*scale),11,10,5)
+    for k in range(4):
+        ang=math.tau*k/4+.2
+        dx, dz=unit*math.cos(ang),unit*math.sin(ang)
+        bar(mesh,(cx+dx,cy-.064*scale,cz+dz),
+                 (cx+dx*.83,cy+.11*scale,cz+dz*.83),.010*scale,10,6)
+    # Carrying handle: curved blackened metal arc.
+    points=[]
+    for k in range(7):
+        ang=math.pi*k/6
+        points.append((cx+.049*math.cos(ang)*scale,
+                       cy+(.15+.055*math.sin(ang))*scale,cz))
+    for a,b in zip(points,points[1:]):bar(mesh,a,b,.009*scale,10,6)
+
+
+def dugout_furnishings(mesh,index,side,outer):
+    """Seeded shelter furnishings. Keep the centre clear up to search depth.
+
+    Big crates at the far wall are future enemy cover, NOT nav blockers.
+    SoldierBrain currently stops before them; later graph/collision work must
+    register these as actual cover and obstacle objects before allowing entry.
+    """
+    if branch_type(index)!='dugout':return
+    rng=random.Random(SEED*11003+index*187+side*351)
+    def spot(along,across,up):return branch_point(index,side,along,across,up)
+    for section in (3.4,5.6,7.4):
+        if section>outer-2.1:continue
+        flank=(-1 if rng.random()<.5 else 1)
+        # Supply piles and military kit pressed against an excavated side wall.
+        lateral=flank*(.82+.045*rng.random())
+        choice=rng.randrange(4)
+        if choice==0:
+            anchor=spot(section,lateral,.23)
+            box(mesh,anchor,(.56,.43,.48),15)
+            box(mesh,spot(section,lateral,.47),(.60,.055,.49),18)
+            for dz in (-.21,.21):
+                box(mesh,spot(section,lateral+dz,.32),(.045,.40,.03),10)
+        elif choice==1:
+            # Rolled blankets / sandbag bedding.
+            for j in range(3):
+                p=spot(section+(j-1)*.24,lateral,.11+rng.random()*.04)
+                blob(mesh,p,(.21,.12,.20),19,13,5,j*1.2)
+            bar(mesh,spot(section-.26,lateral,.26),spot(section+.28,lateral,.28),.021,8,8)
+        elif choice==2:
+            # Timber pallet / improvised short shelf.
+            for end in (-1,1):
+                beam_world(mesh,spot(section+end*.42,lateral,.05),
+                           spot(section+end*.42,lateral,.48),.035,14)
+            for j in range(3):
+                box(mesh,spot(section+(j-1)*.24,lateral,.46),(.20,.045,.45),
+                    (15,16,18)[j])
+            box(mesh,spot(section,lateral,.59),(.35,.22,.23),19)
+        else:
+            # Spent bedding and rope coil, not a raw grey cube.
+            box(mesh,spot(section,lateral,.07),(.8,.10,.38),8)
+            blob(mesh,spot(section,lateral,.17),(.31,.11,.18),9,13,5,section)
+            for j in range(5):
+                a=j*math.tau/5
+                p=spot(section+math.sin(a)*.13,lateral+math.cos(a)*.10,.24)
+                q=spot(section+math.sin(a+.9)*.13,lateral+math.cos(a+.9)*.10,.24)
+                bar(mesh,p,q,.012,10,5)
+    # Large worn cover / supply crates are deliberately behind inspection stop.
+    # Further back => available as *visual* future enemy cover.
+    cover_along=outer-1.15
+    center=spot(cover_along,.08,.52)
+    box(mesh,center,(1.08,1.06,.73),16)
+    for y in (.22,.47,.76):
+        box(mesh,spot(cover_along,.08,y),(.075,.028,.76),18)
+    for dx in (-.45,.45):
+        box(mesh,spot(cover_along+dx,.08,.55),(.055,.99,.08),13)
+    # Battered hanging rags / equipment on the wall; offset remains near bank.
+    if outer>10.5:
+        p=spot(8.7,-.95,1.26)
+        blob(mesh,p,(.29,.35,.07),9,15,6,2.5)
+        bar(mesh,spot(8.35,-.97,1.70),spot(9.04,-.97,1.70),.024,13,9)
+
+
 def lantern_side(k):
     return 1 if noise(k,1882)>.5 else -1
 
@@ -925,6 +1271,14 @@ def nearby_lanterns(s, radius=35.0):
         w=wall_width(k,side)
         h=min(1.8,wall_height(k,side)-.1)
         result.append(world(k,side*(w-.45),h-.18))
+    # Three actual wall lamps per covered main-route tunnel. Bounded lookup.
+    base=max(0,int((s-radius-280.)//504)-1)
+    for cycle in range(base,base+4):
+        for local in (27.,35.,43.):
+            m=280.+cycle*504.+local
+            if abs(m-s)<radius:
+                wall=wall_width(m,-1)
+                result.append(world(m,-(wall-.26),1.66+tunnel_drop(m)))
     # Distant branches are not tracked. Only local, still-visible dugouts
     # contribute a warm accent light around their entrance.
     candidate=nearest_junction(s)
@@ -946,14 +1300,25 @@ def environment_chunk(mesh,start):
         theme=scene_at(s)
         near_branch=near_junction(s,5)
         if near_branch: continue
-        if theme in ('fortified','ruined','marsh','forest') and k%2==0:
-            # duckboards differ in length/rotation slightly, sit flush with mud
-            width=max(1.0,2*min(wall_width(s,-1),wall_width(s,1))-.30)+rng.uniform(-.06,.06)
-            local_box(mesh,s+(rng.random()-.5)*.09,0,-.040,.78,width,.055,
-                      15 if rng.random()<.37 else 16 if rng.random()<.63 else 18)
-        if theme in ('marsh','ruined') and k%5==2:
+        # Patchy plank paths: incomplete parallel strips, shifted seams, mud
+        # gaps and different widths. Avoid identical railway sleepers.
+        if tunnel_drop(s)>-.10 and theme in ('fortified','ruined','marsh','forest') and k%3==0:
+            patch=int(s//21.)
+            if noise(patch,2100)>.24:
+                across=min(.85, min(wall_width(s,-1),wall_width(s,1))-.18)
+                count=3 if noise(patch,2101)<.48 else 4
+                for lane in range(count):
+                    if noise(k*13+lane,2102)<(.10 if theme=='fortified' else .24):continue
+                    lane_offset=-across+(lane+.5)*2*across/count
+                    ds=(noise(k*17+lane,2103)-.5)*.38
+                    length=1.45+.72*noise(k*17+lane,2104)
+                    wid=2*across/count-.025
+                    y=floor_y(s+ds,lane_offset)+.005
+                    local_box(mesh,s+ds,lane_offset,y,length,wid,.032+.015*noise(k+lane,2105),
+                              (15,16,18,8)[int(noise(k*17+lane,2106)*4)])
+        if tunnel_drop(s)>-.10 and theme in ('marsh','ruined') and k%5==2:
             # dark reflective-looking wet mud patches, slightly above the floor
-            local_box(mesh,s,rng.uniform(-.42,.42),-.029,rng.uniform(.7,1.65),
+            local_box(mesh,s,rng.uniform(-.42,.42),floor_y(s,0.)+.014,rng.uniform(.7,1.65),
                       rng.uniform(.42,.98),.012,12)
         if theme in ('fortified','ruined','forest') and k%3==0:
             for side in (-1,1):
@@ -961,7 +1326,7 @@ def environment_chunk(mesh,start):
                 h=wall_height(s,side)
                 # supports only on semi-reinforced sections; posts perpendicular to floor
                 if rng.random()<(.9 if theme=='fortified' else .58):
-                    b=world(s,side*(wall_offset(s,side,0,h)-.09),-.025)
+                    b=world(s,side*(wall_offset(s,side,0,h)-.09),floor_y(s,0.)-.025)
                     t=world(s,side*(wall_offset(s,side,min(h-.13,2.1),h)-.09),min(h-.13,2.1))
                     beam_world(mesh,b,t,.082 if theme!='ruined' else .072, 13 if noise(k+side,801)<.4 else 14)
         # Revetments are substantial, irregular sections of actual timber,
@@ -979,29 +1344,45 @@ def environment_chunk(mesh,start):
                     for j in range(tiers):
                         if not packed and noise(zone*17+j,850+side)<.16:continue
                         jf=(j+.8)/(tiers+.8)
-                        sy=s-1.90; ey=s+1.90
+                        # Each timber has independent endpoints, small gaps,
+                        # taper and diameter; vertical joints hide repetitions.
+                        sy=s-1.8+(.40*(noise(zone*31+j,2201)-.5))
+                        ey=s+1.8+(.58*(noise(zone*31+j,2202)-.5))
                         hs=wall_height(sy,side);he=wall_height(ey,side)
-                        drift=(noise(zone*11+j,810)-.5)*.035
+                        drift=(noise(zone*11+j,810)-.5)*.064
                         ys=hs*(jf+drift);ye=he*(jf+drift)
                         a=world(sy,side*(wall_offset(sy,side,ys,hs)-.10),ys)
                         b=world(ey,side*(wall_offset(ey,side,ye,he)-.10),ye)
                         tone=(13 if noise(zone+j,812)<.40 else
                               14 if noise(zone+j,813)<.47 else
                               8 if noise(zone+j,814)<.62 else 15)
-                        beam_world(mesh,a,b,.103 if packed else .078,tone)
+                        radius=(.072+.054*noise(zone*31+j,2203)) if packed else (.077+.035*noise(zone*31+j,2204))
+                        beam_world(mesh,a,b,radius,tone)
+                    if noise(zone,2210)>.30:
+                        joint_s=s+1.69 + .21*(noise(zone,2211)-.5)
+                        hh=wall_height(joint_s,side)
+                        post_top=min(hh-.10,2.25)
+                        off=side*(wall_offset(joint_s,side,post_top*.55,hh)-.20)
+                        beam_world(mesh,world(joint_s,off,floor_y(joint_s,0.)-.03),
+                                   world(joint_s,off,post_top),
+                                   .09+.018*noise(zone,2212),13 if noise(zone,2213)<.5 else 14)
                 else:  # weathered vertical plank shoring, with narrow irregular gaps
                     for idx in range(5):
-                        ss=s-1.65+idx*.78
+                        ss=s-1.65+idx*.78+.14*(noise(zone*29+idx,2215)-.5)
                         hs=wall_height(ss,side)
-                        ytop=min(2.3,hs-.12) *(.85+.13*noise(zone*23+idx,811))
-                        w=wall_offset(ss,side,ytop*.45,hs)-.13
-                        local_box(mesh,ss,side*w,-.018,.58,.085,ytop,
-                                  15 if noise(zone*33+idx,817)<.34 else 16 if noise(zone*33+idx,818)<.52 else 18)
-        if theme in ('fortified','ruined') and k%23==11:
+                        ytop=min(2.30,hs-.12)*(.68+.31*noise(zone*23+idx,811))
+                        w=wall_offset(ss,side,ytop*.45,hs)-.14
+                        plank_width=.41+.26*noise(zone*33+idx,2216)
+                        # Some planks have a shorter second split layer.
+                        local_box(mesh,ss,side*w,floor_y(ss,0.),plank_width,.065,ytop,
+                                  (15,16,18,8)[int(noise(zone*33+idx,817)*4)])
+                        if noise(zone*37+idx,2217)>.67:
+                            local_box(mesh,ss+.035,side*(w-.045),ytop*.52,plank_width*.73,.04,ytop*.24,15)
+        if tunnel_drop(s)>-.10 and theme in ('fortified','ruined') and k%23==11:
             side=1 if rng.random()<.5 else -1
             w=wall_width(s,side)
             local_box(mesh,s,side*(w-.28),-.035,.8,.42,.58,9) # crate, side-mounted
-        if theme in ('fortified','ruined') and k%19==9:
+        if tunnel_drop(s)>-.10 and theme in ('fortified','ruined') and k%19==9:
             side=1 if rng.random()<.5 else -1
             h=wall_height(s,side)
             # sandbag mound on the wall's lip, not in player path
@@ -1009,7 +1390,7 @@ def environment_chunk(mesh,start):
                 for q in range(3):
                     base=world(s+(q-1)*.47,side*(wall_width(s,side)+.16),h+.11+r*.20)
                     blob(mesh,base,(.37,.16,.26),19,13,5,rng.random()*10)
-        if theme=='fortified' and k%37==16:
+        if tunnel_drop(s)>-.10 and theme=='fortified' and k%37==16:
             side=lantern_side(k)
             w=wall_width(s,side)
             h=min(1.8,wall_height(s,side)-.1)
@@ -1017,10 +1398,10 @@ def environment_chunk(mesh,start):
             foot=world(s,side*(w-.08),h)
             edge=world(s,side*(w-.42),h+.08)
             beam_world(mesh,foot,edge,.025,10)
-            base=world(s,side*(w-.44),h-.20)
-            box(mesh,base,(.18,.32,.17),10)
+            base=world(s,side*(w-.44),h-.30)
+            box(mesh,base,(.18,.055,.18),10)
             flame=world(s,side*(w-.45),h-.18)
-            blob(mesh,flame,(.07,.095,.066),11,9,4)
+            oil_lantern(mesh,flame,.90)
     # V2.8: remove bare grey box "buildings" from the skyline.
     # A real ruin asset with windows/damage should replace these later.
 
@@ -1031,19 +1412,22 @@ def trench_detail_props(mesh, start):
     by SoldierBrain. Everything here fits in a shallow wall-side visual strip.
     The small variation library is a placeholder for future GLB asset instances.
     """
-    first=max(0,int((start-10.0)//6.7)-1)
-    last=int((start+CHUNK_LEN-10.0)//6.7)+2
+    first=max(0,int((start-10.0)//4.4)-1)
+    last=int((start+CHUNK_LEN-10.0)//4.4)+2
     for index in range(first,last):
-        s=10.0+index*6.7+(noise(index,1001)-.5)*2.0
+        # Clumps and empty stretches read as abandoned working areas;
+        # not identical props on alternate sides every 6.7 metres.
+        s=10.0+index*4.4+(noise(index,1001)-.5)*2.7
         if not start<=s<start+CHUNK_LEN:continue
-        if near_junction(s,5.0):continue
-        side=-1 if noise(index,1002)<.5 else 1
+        if near_junction(s,5.0) or tunnel_drop(s)<-.10:continue
+        side=-1 if noise(index//3,1002)<.5 else 1
         w=wall_width(s,side)
         h=wall_height(s,side)
         # Keep the object at wall edge. This is cosmetic dressing only.
         edge=side*max(.65,w-.13)
         rng=random.Random(SEED*917+index*1051)
         choice=noise(index,1003)
+        if noise(index//4,2218)<.13:continue
         if choice<.16:  # weathered ladder against trench wall
             top=min(h-.1,1.8)
             a=world(s-.32,edge-side*.08,.025)
@@ -1107,21 +1491,35 @@ def trench_floor_litter(mesh, start):
         if not start<=s<start+CHUNK_LEN or near_junction(s,3.5):continue
         side=-1 if noise(i,1803)>.5 else 1
         offset=side*min(.88,wall_width(s,side)-.15)
-        if noise(i,1804)>.38:
+        if noise(i,1804)>.38 and tunnel_drop(s)>-.10:
             r=.045+.06*noise(i,1805)
-            blob(mesh,world(s,offset,r*.52-.035),(r*1.45,r*.59,r),17,10,4,i*.47)
+            blob(mesh,world(s,offset,floor_y(s,offset)+r*.52),(r*1.45,r*.59,r),17,10,4,i*.47)
 
 
 def make_chunk(start):
     mesh=MeshBuilder()
+    masks=world_excavation_masks(start)
     stride=SEGMENT
     for i in range(int(CHUNK_LEN/stride)):
         s0=start+i*stride;s1=s0+stride
-        floor_half=1.95  # underlaps even the widest banks; prevents exposed ground seams
-        mesh.quad(world(s0,-floor_half,-.045),world(s0,floor_half,-.045),
-                  world(s1,floor_half,-.045),world(s1,-floor_half,-.045),21,
-                  ((-floor_half,s0*.84),(floor_half,s0*.84),
-                   (floor_half,s1*.84),(-floor_half,s1*.84)))
+        # Real excavated floor, anchored to BOTH banks. The previous fixed
+        # 3.84m-wide floor protruded through walls whenever the trench was
+        # narrow (~1.55m). It produced false overlapping horizontal layers.
+        # A 4cm overlap at each actual bank edge avoids light leaks.
+        def floor_side_edge(s,side):
+            h=wall_height(s,side)
+            return side*(wall_offset(s,side,floor_y(s,0.),h)+.035)
+        lo0,hi0=floor_side_edge(s0,-1),floor_side_edge(s0,1)
+        lo1,hi1=floor_side_edge(s1,-1),floor_side_edge(s1,1)
+        for transverse in range(10):
+            t0=transverse/10.;t1=(transverse+1)/10.
+            a0=smooth(lo0,hi0,t0);b0=smooth(lo0,hi0,t1)
+            a1=smooth(lo1,hi1,t0);b1=smooth(lo1,hi1,t1)
+            mesh.quad(world(s0,a0,floor_y(s0,a0)),
+                      world(s1,a1,floor_y(s1,a1)),
+                      world(s1,b1,floor_y(s1,b1)),
+                      world(s0,b0,floor_y(s0,b0)),21,
+                      ((a0,s0*.84),(a1,s1*.84),(b1,s1*.84),(b0,s0*.84)))
         for side in (-1,1):
             w0,w1=wall_width(s0,side),wall_width(s1,side)
             h0,h1=wall_height(s0,side),wall_height(s1,side)
@@ -1132,7 +1530,7 @@ def make_chunk(start):
             def layers(s,h):
                 # Non-parallel geological strata; vertical segmentation permits
                 # rough excavation faces instead of flat corridor slabs.
-                return [0.,h*(.20+.035*math.sin(s*.053+side)),
+                return [floor_y(s,0.)-.06,h*(.20+.035*math.sin(s*.053+side)),
                         h*(.49+.040*math.sin(s*.073-side)),
                         h*(.77+.028*math.sin(s*.045+side)),h]
             a,b=layers(s0,h0),layers(s1,h1)
@@ -1156,25 +1554,122 @@ def make_chunk(start):
             # Ground is a genuine continuous mesh tied to the lip. At a
             # junction, remove ALL terrain spanning the excavated branch,
             # not just the first ring (that produced the see-through strips).
-            offsets0=[wall_offset(s0,side,h0,h0)-.05,3.5,7.0,12.0,18.0,32.0,60.0]
-            offsets1=[wall_offset(s1,side,h1,h1)-.05,3.5,7.0,12.0,18.0,32.0,60.0]
+            offsets0=[wall_offset(s0,side,h0,h0)-.05,3.,4.,5.,6.,7.,
+                      8.5,10.,12.,14.,16.,18.,22.,27.,34.,43.,56.,75.,105.,145.]
+            offsets1=[wall_offset(s1,side,h1,h1)-.05,3.,4.,5.,6.,7.,
+                      8.5,10.,12.,14.,16.,18.,22.,27.,34.,43.,56.,75.,105.,145.]
             for k in range(len(offsets0)-1):
                 oa,ob=offsets0[k:k+2];oc,od=offsets1[k:k+2]
-                if cut and min(oa,oc)<12.0:
-                    continue
-                y0=h0-.055 if k==0 else hill_y(s0,side,side*oa)
-                y1=h1-.055 if k==0 else hill_y(s1,side,side*oc)
-                y2=hill_y(s0,side,side*ob)
-                y3=hill_y(s1,side,side*od)
-                mesh.quad(world(s0,side*oa,y0),world(s0,side*ob,y2),
-                          world(s1,side*od,y3),world(s1,side*oc,y1),3,
-                          ((s0*.18,oa*.22),(s0*.18,ob*.22),
-                           (s1*.18,od*.22),(s1*.18,oc*.22)))
-        # Fixed-position, subtle crossing timbers for visible forward movement.
-        if int(s0)%8==0:
-            lo,hi=world(s0,-min(.91,wall_width(s0,-1)-.1),.005),world(s0,min(.91,wall_width(s0,1)-.1),.005)
-            lo2,hi2=world(s0+.16,-min(.91,wall_width(s0+.16,-1)-.1),.005),world(s0+.16,min(.91,wall_width(s0+.16,1)-.1),.005)
+                # Excavate all the way under the dugout, not merely <12m
+                # from the trench mouth. Any crossing surface is removed.
+                # Roof side skirts below rejoin this overburden cleanly.
+                # Terrain is clipped by REAL X/Z tunnel/dugout footprints.
+                # A broad terrain strip may cross an entire passage without
+                # any of its vertices or centre landing inside the cutout.
+                # Recursively split such strips: don't delete whole 30m-long
+                # field patches (which would punch giant holes in the horizon).
+                def emit_field_strip(left,right,depth=0):
+                    p0=world(s0,side*left,0.)
+                    p1=world(s0,side*right,0.)
+                    p2=world(s1,side*right,0.)
+                    p3=world(s1,side*left,0.)
+                    quad=((p0[0],p0[2]),(p1[0],p1[2]),
+                          (p2[0],p2[2]),(p3[0],p3[2]))
+                    if ground_patch_intersects_excavation(quad,masks):
+                        if right-left>1.0 and depth<9:
+                            middle=(left+right)*.5
+                            emit_field_strip(left,middle,depth+1)
+                            emit_field_strip(middle,right,depth+1)
+                        return
+                    # The ground starts at exactly the excavated lip for
+                    # local strip zero, with the same s/y as the wall rim.
+                    def terrain_y(ss,dist):
+                        if k==0 and abs(dist-left)<1e-8:
+                            return wall_height(ss,side)-.055
+                        return hill_y(ss,side,side*dist)
+                    ya0=terrain_y(s0,left);ya1=terrain_y(s0,right)
+                    yb0=terrain_y(s1,left);yb1=terrain_y(s1,right)
+                    mesh.quad(world(s0,side*left,ya0),world(s0,side*right,ya1),
+                              world(s1,side*right,yb1),world(s1,side*left,yb0),3,
+                              ((s0*.18,left*.22),(s0*.18,right*.22),
+                               (s1*.18,right*.22),(s1*.18,left*.22)))
+                # Preserve the original slightly overlapping lip as a stitch;
+                # mask overlap near a cave entry may deliberately remove it.
+                emit_field_strip(oa,ob)
+        # Sparse exposed sleeper remnants, not evenly spaced rail ties.
+        if int(s0)%9==0 and noise(int(s0)//9,990)>.35 and tunnel_open(s0)<.25:
+            lo,hi=world(s0,-min(.91,wall_width(s0,-1)-.1),floor_y(s0,0)+.026),world(s0,min(.91,wall_width(s0,1)-.1),floor_y(s0,0)+.026)
+            lo2,hi2=world(s0+.16,-min(.91,wall_width(s0+.16,-1)-.1),floor_y(s0+.16,0)+.026),world(s0+.16,min(.91,wall_width(s0+.16,1)-.1),floor_y(s0+.16,0)+.026)
             mesh.quad(lo,hi,hi2,lo2,2,((0,0),(2.1,0),(2.1,.18),(0,.18)))
+    # Longitudinal covered passages: real roof, descending then climbing dirt
+    # floor. Portal edges connect to the bank lip rather than floating mid-air.
+    for k in range(int(start),int(start+CHUNK_LEN)):
+        a,b=float(k),float(k+1)
+        if min(tunnel_open(a),tunnel_open(b))<.01:continue
+        ha=(wall_height(a,-1),wall_height(a,1))
+        hb=(wall_height(b,-1),wall_height(b,1))
+        wa=(wall_width(a,-1)+.13,wall_width(a,1)+.13)
+        wb=(wall_width(b,-1)+.13,wall_width(b,1)+.13)
+        for j in range(12):
+            ra=-1+2*j/12;rb=-1+2*(j+1)/12
+            def roof_shoulders(ss,heights):
+                # Guaranteed headroom from the actual (potentially ramped)
+                # floor, INCLUDING the shoulders near the wall. The old
+                # tunnel directly reused bank heights, which can fall to 1m
+                # and clip a standing player's head in later tunnel cycles.
+                minimum=floor_y(ss,0.)+2.16
+                exposure=tunnel_open(ss)
+                return tuple(smooth(h,max(h,minimum),exposure) for h in heights)
+            def arch(ss,rr,heights):
+                h0,h1=roof_shoulders(ss,heights)
+                edge=smooth(h0,h1,(rr+1)*.5)
+                crown=max(h0,h1)+.43
+                return edge+(crown-edge)*math.sqrt(max(0.,1-rr*rr))
+            def ap(ss,rr,ww,heights,extra=0.):
+                half=ww[0] if rr<0 else ww[1]
+                return world(ss,half*rr,arch(ss,rr,heights)+extra)
+            mesh.quad(ap(a,ra,wa,ha),ap(b,ra,wb,hb),
+                      ap(b,rb,wb,hb),ap(a,rb,wa,ha),20,
+                      ((a*.91,ra),(b*.91,ra),(b*.91,rb),(a*.91,rb)))
+            # Top of tunnel: continuous thin overburden skin, not ordinary
+            # outdoor terrain crossing THROUGH the interior arch.
+            mesh.quad(ap(a,ra,wa,ha,.24),ap(a,rb,wa,ha,.24),
+                      ap(b,rb,wb,hb,.24),ap(b,ra,wb,hb,.24),3,
+                      ((a*.16,ra*.36),(a*.16,rb*.36),
+                       (b*.16,rb*.36),(b*.16,ra*.36)))
+        # Join elevated ceiling shoulders back down to the real excavated
+        # wall tops. Without these panels the higher roof would float above
+        # shallow earthen banks, producing new light leaks at the sides.
+        for side in (-1,1):
+            idx=0 if side<0 else 1
+            top_a=roof_shoulders(a,ha)[idx]
+            top_b=roof_shoulders(b,hb)[idx]
+            base_a=ha[idx];base_b=hb[idx]
+            if max(top_a-base_a,top_b-base_b)>.001:
+                across_a=side*wa[idx];across_b=side*wb[idx]
+                mesh.quad(world(a,across_a,base_a),world(b,across_b,base_b),
+                          world(b,across_b,top_b),world(a,across_a,top_a),20,
+                          ((a,base_a),(b,base_b),(b,top_b),(a,top_a)))
+        if (k-280)%504 in (27,35,43):
+            m=float(k)
+            foot=world(m,-(wall_width(m,-1)-.08),1.70+tunnel_drop(m))
+            flame=world(m,-(wall_width(m,-1)-.26),1.66+tunnel_drop(m))
+            beam_world(mesh,foot,flame,.023,10)
+            oil_lantern(mesh,flame,.90)
+        if k%4==0:
+            # Broken shoring frames suggest underground excavation.
+            for side in (-1,1):
+                h=wall_height(a,side)
+                pos=world(a,side*(wall_width(a,side)-.09),floor_y(a,0))
+                tip=world(a,side*(wall_width(a,side)-.09),h-.1)
+                beam_world(mesh,pos,tip,.067,13 if k%8 else 14)
+            for j in range(8):
+                r0=-1+2*j/8.;r1=-1+2*(j+1)/8.
+                def pt(r):
+                    return world(a,r*(wa[0] if r<0 else wa[1]),
+                                 arch(a,r,ha)-.045)
+                beam_world(mesh,pt(r0),pt(r1),.053,15 if k%8 else 13)
+
     # Seeded T/Y/X side passages. Cave roof and banks are real 3D surfaces;
     # never draw a large rectangular room or an exposed square cutout.
     for marker in range(JUNCTION_FIRST, int(start+CHUNK_LEN)+1, JUNCTION_SPACING):
@@ -1198,8 +1693,8 @@ def make_chunk(start):
                         z+branch_side*right[1]*dist+forward[1]*shifted)
 
             def hw(along):return branch_half_width(branch_idx,along)
-            def shoulder(along):return 1.27+.08*math.sin(along*.47+branch_idx)
-            def crown(along):return max(1.94, min(2.22,sideheight+.30))+.07*math.sin(along*.51+branch_idx)
+            def shoulder(along):return 1.55+.07*math.sin(along*.47+branch_idx)
+            def crown(along):return max(2.32, min(2.62,sideheight+.60))+.05*math.sin(along*.51+branch_idx)
             def vaulted(along,ratio):
                 # ratio:-1..+1. A broken irregular ellipse/cave arch.
                 r=max(-1.0,min(1.0,ratio))
@@ -1208,8 +1703,10 @@ def make_chunk(start):
             for n in range(int(outer)):
                 a=float(n);b=a+1.0
                 wa,wb=hw(a),hw(b)
-                mesh.quad(bp(a,-wa,-.052),bp(a,wa,-.052),
-                          bp(b,wb,-.052),bp(b,-wb,-.052),21,
+                fa=floor_y(marker,0.)+.025*math.sin(a*.79+branch_idx*.73)
+                fb=floor_y(marker,0.)+.025*math.sin(b*.79+branch_idx*.73)
+                mesh.quad(bp(a,-wa,fa-.004),bp(a,wa,fa-.004),
+                          bp(b,wb,fb-.004),bp(b,-wb,fb-.004),21,
                           ((a*.81,-wa),(a*.81,wa),(b*.81,wb),(b*.81,-wb)))
                 # Narrow, irregular walls: not a box with four flat sides.
                 for flank in (-1,1):
@@ -1221,19 +1718,19 @@ def make_chunk(start):
                         ab=wa+(.035*math.sin(a*.9+(j+1)*1.4+flank))*t1
                         ba=wb+(.035*math.sin(b*.9+j*1.4+flank))*t0
                         bb=wb+(.035*math.sin(b*.9+(j+1)*1.4+flank))*t1
-                        mesh.quad(bp(a,flank*aa,-.04+(ya+.04)*t0),
-                                  bp(a,flank*ab,-.04+(ya+.04)*t1),
-                                  bp(b,flank*bb,-.04+(yb+.04)*t1),
-                                  bp(b,flank*ba,-.04+(yb+.04)*t0),20,
+                        mesh.quad(bp(a,flank*aa,fa-.05+(ya-fa+.05)*t0),
+                                  bp(a,flank*ab,fa-.05+(ya-fa+.05)*t1),
+                                  bp(b,flank*bb,fb-.05+(yb-fb+.05)*t1),
+                                  bp(b,flank*ba,fb-.05+(yb-fb+.05)*t0),20,
                                   ((a,t0*ya),(a,t1*ya),(b,t1*yb),(b,t0*yb)))
                 if roofed and n==5:
                     # One enclosed, wall-mounted lantern and a tiny shelf.
                     # Same location is passed to GPU lighting via nearby_lanterns.
                     anchor=bp(a,-.78,1.68)
                     bracket=bp(a,-.78,1.88)
-                    beam_world(mesh,anchor,bracket,.017,10)
-                    blob(mesh,bp(a,-.78,1.72),(.060,.090,.060),11,10,4)
-                    box(mesh,bp(a,-.78,1.59),(.19,.07,.20),10)
+                    beam_world(mesh,anchor,bracket,.018,10)
+                    oil_lantern(mesh,bp(a,-.78,1.72),.78)
+                    box(mesh,bp(a,-.78,1.52),(.19,.06,.21),8)
                 if roofed:
                     # Curved vaulted roof: 10 subdivisions, with uneven timber
                     # beams to suggest hand-excavated dugouts.
@@ -1247,6 +1744,33 @@ def make_chunk(start):
                                   bp(a,wa*rb,vaulted(a,rb)),20,
                                   ((a,j*.24),(b,j*.24),
                                    (b,(j+1)*.24),(a,(j+1)*.24)))
+                    # Earth bank *outside* the vaulted roof, covering its
+                    # side openings and reconnecting to continuous terrain.
+                    # The V2.9 roof was only one surface; terrain crossed
+                    # through it farther down the dugout (floating earth).
+                    for flank in (-1,1):
+                        aw,bw=hw(a),hw(b)
+                        roof_a=bp(a,flank*aw,shoulder(a))
+                        roof_b=bp(b,flank*bw,shoulder(b))
+                        for t0,t1 in ((0.,.5),(.5,1.)):
+                            w0=aw+t0*1.5;w1=aw+t1*1.5
+                            v0=bw+t0*1.5;v1=bw+t1*1.5
+                            # Soil rests on terrain, no disconnected slab.
+                            y00=smooth(shoulder(a)+.14,sideheight+.04,t0)
+                            y01=smooth(shoulder(a)+.14,sideheight+.04,t1)
+                            y10=smooth(shoulder(b)+.14,sideheight+.04,t0)
+                            y11=smooth(shoulder(b)+.14,sideheight+.04,t1)
+                            mesh.quad(bp(a,flank*w0,y00),bp(a,flank*w1,y01),
+                                      bp(b,flank*v1,y11),bp(b,flank*v0,y10),3,
+                                      ((a,t0),(a,t1),(b,t1),(b,t0)))
+                    # Rough outer shell above cave roof; thickness .22m.
+                    for j in range(10):
+                        ra=-1.+2*j/10.; rb=-1.+2*(j+1)/10.
+                        mesh.quad(bp(a,wa*ra,vaulted(a,ra)+.22),
+                                  bp(a,wa*rb,vaulted(a,rb)+.22),
+                                  bp(b,wb*rb,vaulted(b,rb)+.22),
+                                  bp(b,wb*ra,vaulted(b,ra)+.22),3,
+                                  ((a,ra),(a,rb),(b,rb),(b,ra)))
                     if n in (1,4,7,10,13):
                         # Posts and arch frame members follow roof, not a flat lid.
                         for flank in (-1,1):
@@ -1261,9 +1785,11 @@ def make_chunk(start):
                 # A few seeded uneven floor boards inside buried sections.
                 if roofed and n%3==1 and n>2:
                     width=max(.9,2*min(wa,wb)-.17)
-                    mesh.quad(bp(a,-width*.5,-.024),bp(a,width*.5,-.024),
-                              bp(a+.58,width*.5,-.024),bp(a+.58,-width*.5,-.024),15,
+                    ypl=floor_y(marker,0.)+.017
+                    mesh.quad(bp(a,-width*.5,ypl),bp(a,width*.5,ypl),
+                              bp(a+.58,width*.5,ypl),bp(a+.58,-width*.5,ypl),15,
                               ((0,0),(width,0),(width,.58),(0,.58)))
+            dugout_furnishings(mesh,branch_idx,branch_side,outer)
             # The end is sealed by an arched cave face; no square end wall.
             end_width=hw(outer)
             if roofed:
@@ -1284,6 +1810,7 @@ def make_chunk(start):
                           ((-end_width,0),(-end_width,sideheight),
                            (end_width,sideheight),(end_width,0)))
     scenery_chunk(mesh,start)
+    battlefield_debris_chunk(mesh,start)
     rim_vegetation_chunk(mesh,start)
     environment_chunk(mesh,start)
     draw_trench_obstacles(mesh,start)
@@ -1380,7 +1907,7 @@ class SoldierBrain:
         length=float(branch_length(index))
         if branch_type(index)=='dugout':
             # The end is hidden beneath an arch, so walking in briefly is sane.
-            return min(length-2.0, 3.9 + 2.4*noise(index,1179))
+            return min(length-2.1, 6.4 + 1.9*noise(index,1179))
         bend=abs(branch_center_shift(index,length))
         if bend < .43:
             return 0.0 if noise(index,155)<.7 else max(CORNER_DEPTH+0.6,min(length-2.,1.3+noise(index,157)*1.8))
@@ -1411,6 +1938,7 @@ class SoldierBrain:
             'dash':(0.,0.,0.,0.),
             'kneel_scan':(0.,-side*.018,0.,0.),
             'explore':(0.,0.,0.,0.),
+            'dugout_clear':(0.,0.,0.,0.),
             'turn_back':(0.,0.,0.,0.),
             'backtrack':(0.,0.,0.,0.),
             'turn_main':(0.,0.,0.,0.),
@@ -1422,6 +1950,12 @@ class SoldierBrain:
             'bend_assess':(side*.20,0.,0.,0.),
         }
         self.look_target,self.roll_target,self.shift_target,self.forward_target=targets.get(self.state,(0.,0.,0.,0.))
+        if self.state=='dugout_clear':
+            # Observe right/left and back to centre while kneeling. The head
+            # moves; the body and walking path do not snap sideways.
+            phase=1.0-self.wait/max(.1,self.inspect_duration)
+            self.look_target=.33*math.sin(phase*math.tau)*(.75+.25*noise(self.branch_index,2931))
+            self.roll_target=-self.look_target*.035
 
     def _tick_pose(self,dt):
         # Small, time-based angular and shoulder changes; never snap.
@@ -1630,6 +2164,9 @@ class SoldierBrain:
                 elif self.state=='kneel_scan':
                     self.state='explore'
                     self.phase='undersöker bortre hörnet'
+                elif self.state=='dugout_clear':
+                    self.state='turn_back'
+                    self.phase='återvänder efter genomsökning'
                 elif self.state=='rejoin':
                     self.state='main'
                     self.phase='fortsätter längs huvudgången'
@@ -1666,7 +2203,7 @@ class SoldierBrain:
         if self.state in ('approach','edge','peek','retract','assess','move_to_mouth','turn_in','turn_back','turn_main','rejoin'):
             return 4 if self.state in ('approach','move_to_mouth','turn_in','turn_main') else (1 if self.state in ('edge','peek','retract','assess') else 0)
         if self.state=='dash':return 8
-        if self.state=='kneel_scan':return 1
+        if self.state in ('kneel_scan','dugout_clear'):return 1
         if self.state=='explore':return 4
         if self.state=='backtrack':return 5
         return 0
@@ -1716,9 +2253,13 @@ class SoldierBrain:
             travel=min(movement,max(0.,self.investigate_depth-self.branch_progress))
             self.branch_progress+=travel
             if self.branch_progress>=self.investigate_depth-.015:
-                self.state='turn_back'
-                self.wait=0.0
-                self.phase='vänder kroppen kontrollerat'
+                if branch_type(self.branch_index)=='dugout':
+                    self._start('dugout_clear',1.45+noise(self.branch_index,2932)*.7,
+                                'knästående söker av skyddsrummet')
+                else:
+                    self.state='turn_back'
+                    self.wait=0.0
+                    self.phase='vänder kroppen kontrollerat'
             return distance,travel
         if self.state=='turn_back':
             if self._heading_aligned(distance,goal='back'):
@@ -1838,6 +2379,7 @@ class Trench:
         self.gait_lateral=0.0;self.gait_vertical=0.0;self.gait_roll=0.0
         self.elapsed=0.;self.paused=False;self.fps=0.;self.ui_timer=0.
         self.obstacle_camera_lift=0.0
+        self.terrain_eye_base=floor_y(0.,0.)
         self.view_heading=None;self.last_dt=1/60;self.camera_roll=0.0
         self.last=time.monotonic();self.running=True
         self.frame_size=(W,H)
@@ -1967,7 +2509,7 @@ class Trench:
                 self.fog_strength=min(3.,self.fog_strength+.2)
                 print(f'Dimma: {self.fog_strength:.1f} (F7 mindre, F8 mer)')
             elif event.key in (pygame.K_SPACE,pygame.K_p):self.paused=not self.paused
-            elif event.key==pygame.K_r:self.distance=0;self.elapsed=0;self.step_distance=0;self.speed=0;self.gait_strength=0;self.last_moved=0;self.gait_lateral=0;self.gait_vertical=0;self.gait_roll=0;self.brain.reset();self.view_heading=None;self.obstacle_camera_lift=0.0
+            elif event.key==pygame.K_r:self.distance=0;self.elapsed=0;self.step_distance=0;self.speed=0;self.gait_strength=0;self.last_moved=0;self.gait_lateral=0;self.gait_vertical=0;self.gait_roll=0;self.brain.reset();self.view_heading=None;self.obstacle_camera_lift=0.0;self.terrain_eye_base=floor_y(0.,0.)
             elif event.key==pygame.K_0:self.auto=True
             elif pygame.K_1<=event.key<=pygame.K_9:
                 self.auto=False;self.mode=event.key-pygame.K_1
@@ -2042,7 +2584,18 @@ class Trench:
         crouch=max(0.,min(1.,(1.42-self.height)/.40))
         x+=math.sin(heading)*.075*crouch
         z+=math.cos(heading)*.075*crouch
-        eye=(x,self.height+bob+breath+self.obstacle_camera_lift,z)
+        # Head follows actual displaced floor, with low-pass motion so small
+        # ruts never masquerade as abrupt stepwise footfalls. Dugouts use their
+        # own near-level floor, shared with floor mesh at the entrance.
+        ground_target=(floor_y(self.distance,0.) if not self.auto or
+                       self.brain.state in ('main','approach','edge','peek','retract','assess',
+                                            'move_to_mouth','rejoin','bend_approach',
+                                            'bend_settle','bend_peek','bend_retract','bend_assess')
+                       else floor_y(junction_marker(self.brain.branch_index),0.)
+                       if self.brain.branch_index is not None else floor_y(self.distance,0.))
+        self.terrain_eye_base=smooth(self.terrain_eye_base,ground_target,
+                                      1.-math.exp(-dt*5.2))
+        eye=(x,self.height+bob+breath+self.obstacle_camera_lift+self.terrain_eye_base,z)
         heading=heading+self.look+(self.brain.look_offset if self.auto else 0.)
         eye_y=eye[1]
         pitch=self.brain.gaze_pitch if self.auto else 0.0
@@ -2097,7 +2650,7 @@ class Trench:
                 if self.ui_timer>.3:
                     self.ui_timer=0
                     name=MOVES[self.mode][0]
-                    pygame.display.set_caption(f'3D SKYTTEGRAV V2.9 | {self.distance:06.0f} m | {self.brain.phase if self.auto else name} | {name} {self.speed:.1f} m/s | {self.fps:.0f} FPS | max {self.frame_max_ms:.0f}ms · upload {self.chunk_upload_ms:.0f}ms | 0 AUTO · F9/F10 FLYTTA · SPACE PAUS · R RESET · ESC AVSLUTA')
+                    pygame.display.set_caption(f'3D SKYTTEGRAV V3.1 | {self.distance:06.0f} m | {self.brain.phase if self.auto else name} | {name} {self.speed:.1f} m/s | {self.fps:.0f} FPS | max {self.frame_max_ms:.0f}ms · upload {self.chunk_upload_ms:.0f}ms | 0 AUTO · F9/F10 FLYTTA · SPACE PAUS · R RESET · ESC AVSLUTA')
                 pygame.time.wait(1)
         finally:
             for vbo,vao,_ in self.chunks.values():vao.release();vbo.release()
