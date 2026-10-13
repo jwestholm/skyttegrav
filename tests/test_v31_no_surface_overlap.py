@@ -62,13 +62,13 @@ class SurfaceIntegrityTests(unittest.TestCase):
             if g['tunnel_open'](s)<.70:continue
             for offset in (-.24,0.,.24):
                 x,z=g['sides'](float(s),offset)
-                ys=layers_at(meshes,x,z,[3,20,21])
+                ys=layers_at(meshes,x,z,[3,20,21,22])
                 floor=g['floor_y'](float(s),offset)
                 roofs=[h for h,layer in ys if layer==20 and h>floor+1.1]
                 self.assertTrue(roofs,(s,offset,ys))
                 roof=min(roofs)
                 self.assertGreater(roof-floor,1.90,(s,offset,roof,floor))
-                soil=[h for h,layer in ys if layer==3]
+                soil=[h for h,layer in ys if layer in (3,22)]
                 self.assertFalse([h for h in soil if floor+.10<h<roof+.10],
                                  (s,offset,floor,roof,ys))
                 inspected+=1
@@ -88,7 +88,7 @@ class SurfaceIntegrityTests(unittest.TestCase):
                     if along>=g['branch_length'](i)-.8:continue
                     for lateral in (-.25,0.,.25):
                         x,_,z=g['branch_point'](i,side,along,lateral,0.)
-                        ys=layers_at(meshes,x,z,[3,20,21])
+                        ys=layers_at(meshes,x,z,[3,20,21,22])
                         roof=[y for y,layer in ys if layer==20 and y>1.1]
                         self.assertTrue(roof,(i,side,along,lateral,ys))
                         ceiling=min(roof)
@@ -114,7 +114,7 @@ class SurfaceIntegrityTests(unittest.TestCase):
                 continue
             for across in (-.23,0.,.23):
                 x,z=g['sides'](float(s),across)
-                earth=layers_at(meshes,x,z,[3])
+                earth=layers_at(meshes,x,z,[3,22])
                 self.assertFalse(earth,(s,across,earth))
                 count+=1
         self.assertGreater(count,30)

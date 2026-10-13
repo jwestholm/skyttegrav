@@ -29,11 +29,13 @@ def runtime_geometry():
         'world_excavation_masks','soil_over_excavation',
         '_cutout_polygon_intersects_ground','_branch_footprint','_main_tunnel_footprint',
         '_main_route_footprint',
-        'ground_patch_intersects_excavation',
+        'ground_patch_intersects_excavation','exterior_prop_ground',
         'obstacles_in_range','trench_obstacle','obstacle_steering',
-        'draw_trench_obstacles','bar','blob','vec_normal','box','local_box',
+        'draw_trench_obstacles','bar','blob','rock_fragment','sandbag_mesh',
+        'ruined_wall_panel','ruined_outpost','hanging_fabric','torn_camouflage_net','vec_normal','box','local_box',
         'beam_world','scene_at','scenery_chunk','environment_chunk','trench_detail_props','make_chunk',
         'grass_tuft','rim_vegetation_chunk','trench_floor_litter','wood_crate',
+        '_terrain_route_segments','_nearest_terrain_route','_exterior_y_world','build_exterior_terrain',
     }
     class_names={'MeshBuilder','TrenchObstacle','SoldierBrain'}
     selected=[node for node in tree.body if isinstance(node,(ast.FunctionDef,ast.ClassDef))
@@ -48,6 +50,8 @@ def runtime_geometry():
         'CORNER_DEPTH':1.50,'CORNER_MAIN_OFFSET':1.15,
         'COVER_EYE_CLEARANCE':.49,
         'SCENES':('fortified','exposed','ruined','marsh','forest','rocky'),
+        'OUTDOOR_TILE_METRES':12.0,'OUTDOOR_CELL_METRES':3.0,
+        'OUTDOOR_RADIUS_METRES':105.0,'OUTDOOR_MASK_SUBDIVISIONS':5,
     }
     exec(compile(ast.Module(body=selected,type_ignores=[]),str(SOURCE),'exec'),env)
     return env

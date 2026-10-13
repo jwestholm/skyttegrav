@@ -19,7 +19,11 @@ class SurfaceV28Tests(unittest.TestCase):
         self.assertIn('v_layer == 21',SRC)
         self.assertIn('texture(materials,vec3(uv,float(layer)))',SRC)
         self.assertIn('mesh.quad(p0,p1,p2,p3,20,',SRC)
-        self.assertIn('world(s1,floor_half,-.045),world(s1,-floor_half,-.045),21,',SRC)
+        # V3.1 narrowed the floor to actual bank widths; the V2.8
+        # fixed-width floor assertion would recreate a verified overlap.
+        self.assertIn('def floor_side_edge(s,side):',SRC)
+        self.assertIn('world(s0,a0,floor_y(s0,a0))',SRC)
+        self.assertNotIn('world(s1,floor_half,-.045)',SRC)
         self.assertNotIn('mesh.quad(p0,p1,p2,p3,mat,',SRC)
 
     def test_vegetation_is_bounded_deterministic_near_lip(self):
@@ -37,7 +41,8 @@ class SurfaceV28Tests(unittest.TestCase):
             self.assertEqual(a.quads,b.quads)
             self.assertLess(len(a.quads),2400)
             for quad in a.quads:
-                self.assertEqual(quad[4],6 if len(quad)>=6 and quad[2]==quad[3] else 17)
+                # V3.7 deliberately uses stone material 7, not mossy-rock layer 17.
+                self.assertEqual(quad[4],6 if len(quad)>=6 and quad[2]==quad[3] else 7)
 
     def test_world_generation_is_finite_bounded(self):
         m=self.m
@@ -55,7 +60,7 @@ class SurfaceV28Tests(unittest.TestCase):
 
     def test_crate_gains_geometry_without_changing_obstacle_decisions(self):
         m=self.m
-        obs_before=[(ob.index,ob.s,ob.kind,ob.detour) for ob in m['obstacles_in_range'](0,400)]
+        obs_before=[(ob.index,ob.s,ob.kind,ob.detour) for ob in m['obstacles_in_range'](0,2500)]
         self.assertTrue(any(ob[2]=='crate' for ob in obs_before))
         a=m['MeshBuilder']();m['wood_crate'](a,20,0,-.04,.72,.54,.58,15)
         self.assertGreater(len(a.vertices)//9,300)

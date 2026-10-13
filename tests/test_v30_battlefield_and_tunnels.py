@@ -89,33 +89,34 @@ class BattlefieldV30Tests(unittest.TestCase):
         self.assertEqual(brain.state,'turn_back')
 
     def test_no_floating_terrain_inside_first_dugouts(self):
-        """Reproduce the floating dark ground patch seen in V2.9 pictures.
+        """Sample the ACTUAL triangles where the camera walks.
 
-        Roof shell material 3 is allowed ABOVE the cave roof, but no terrain
-        is permitted at shoulder height halfway inside the tunnel.
+        The pre-V3.1 test inspected every mesh centroid but was painfully
+        slow and still missed long triangles crossing roofed corridors.
+        Barycentric X/Z intersections catch those crossings directly.
         """
+        from test_v31_no_surface_overlap import layers_at
         g=self.g
+        inspected=0
         for i in (0,3,4,5,6):
             if g['branch_type'](i)!='dugout':continue
             marker=g['junction_marker'](i)
             mesh=g['make_chunk'](math.floor(marker/80)*80)
-            tri=mesh.reshape(-1,3,9)
-            xyz=tri[:,:,:3].mean(axis=1)
-            layer=mesh[::3,8].astype(int)
-            x,z,h=g['route'](marker)
-            right=np.array([math.cos(h),-math.sin(h)])
-            forward=np.array([math.sin(h),math.cos(h)])
-            rel=xyz[:,[0,2]]-np.array([x,z])
             for side in g['junction_sides'](i):
-                near=max(g['wall_width'](marker,side),g['wall_width'](marker-2,side),
-                         g['wall_width'](marker+2,side))-.18
-                depth=side*(rel@right)-near
-                shift=np.array([g['branch_center_shift'](i,d) if 0<d<g['branch_length'](i)
-                                else 0 for d in depth])
-                across=(rel@forward)-shift
-                bad=((layer==3)&(depth>2)&(depth<g['branch_length'](i)-.5)&
-                     (abs(across)<.45)&(xyz[:,1]<1.45))
-                self.assertEqual(int(np.count_nonzero(bad)),0,(i,side))
+                for along in (3.35,5.25,7.15):
+                    if along>g['branch_length'](i)-1.0:continue
+                    for lateral in (-.22,0.,.22):
+                        x,_,z=g['branch_point'](i,side,along,lateral,0.)
+                        heights=layers_at([mesh],x,z,[3,20,21,22])
+                        roofs=[y for y,layer in heights if layer==20 and y>1.2]
+                        self.assertTrue(roofs,(i,side,along,heights))
+                        roof=min(roofs)
+                        self.assertGreater(roof-g['floor_y'](marker,0.),2.05)
+                        intrusions=[y for y,layer in heights if layer in (3,22)
+                                    and g['floor_y'](marker,0.)+.12<y<roof+.06]
+                        self.assertFalse(intrusions,(i,side,along,intrusions))
+                        inspected+=1
+        self.assertGreater(inspected,20)
 
 
 if __name__=='__main__':unittest.main()
