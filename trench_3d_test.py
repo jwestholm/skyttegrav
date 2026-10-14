@@ -5,6 +5,7 @@ Run: python3 trench_3d_test.py
 from __future__ import annotations
 
 import math
+from collections import OrderedDict
 import queue
 import threading
 import random
@@ -12,7 +13,14 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from enemy_system import EnemyDirector, actor_facing, enemy_parts
+from enemy_system import EnemyDirector, EnemyAgent, EnemySpec, actor_facing, enemy_parts
+from arcade_mode import ArcadeRun
+from combat_visibility import player_body, can_see_body, enemy_faces_player, enemy_shown_to_player
+from combat_tactics import difficulty_at, MATERIALS
+from death_screen import DeathScreen
+from shadow_lighting import ShadowRenderer, SHADOW_GLSL
+from rig_renderer import SkeletalEnemyRenderer
+from skeletal_pose import POSE_LAB
 from battlefield_events import BattlefieldEventDirector, BattlefieldEffectRenderer, blast_reaction_level
 
 try:
@@ -51,6 +59,12 @@ BEND_SPACING = 34
 PREFETCH_AHEAD = 5
 RETAIN_BEHIND = 2
 UPLOADS_PER_FRAME = 1
+# Debug scrub: debounce autorepeated key presses, hold current scene until
+# centre, next, and previous chunk exist. Never move into unbuilt geometry.
+JUMP_KEY_SETTLE_SECONDS = 0.23
+JUMP_MESH_RETRIES = 2
+CHUNK_FAILURE_BACKOFF_SECONDS = 12.0  # transient errors may recover
+MESH_CACHE_CHUNKS = 6  # bounded CPU-only cache (~40 MB typical)
 WALL_HALF_WIDTH = 1.12
 FAR = 290.0
 
@@ -110,6 +124,9 @@ uniform int use_pbr_normals;
 uniform int lamp_count;
 uniform vec3 lamp_positions[8];
 uniform float fog_strength;
+uniform vec3 camera_position;
+uniform vec3 sun_direction;
+uniform vec3 moon_direction;
 out vec4 f_color;
 
 // 20 = excavated earth, 21 = trench floor, 22 = world-grid terrain.
@@ -123,6 +140,8 @@ float terrain_pattern(vec3 p) {
 vec3 sample_color(vec2 uv,int layer) {
     return texture(materials,vec3(uv,float(layer))).rgb;
 }
+// V3.9.2 real depth shadow maps; shared by world and actors.
+''' + SHADOW_GLSL + '''
 void main(){
     vec3 n=normalize(v_normal);
     vec3 col;
@@ -175,12 +194,17 @@ void main(){
             n=normalize(mat3(t,b,n)*vec3(tangent_norm.xy*.72,tangent_norm.z));
         }
     }
-    vec3 sun=normalize(vec3(0.35,0.085,0.93));
-    vec3 moon=normalize(vec3(-0.38,0.40,-0.69));
+    vec3 sun=normalize(sun_direction);
+    vec3 moon=normalize(moon_direction);
     float diffuse=max(dot(n,sun),0.0);
     float moonlight=max(dot(n,moon),0.0);
     // Dusk: muted ambient earth, directional sunlight and cool moon fill.
-    float brightness=.37 + .52*diffuse + .10*moonlight;
+    // Only the directional components are shadowed: ambient never disappears.
+    float sun_vis=(shadow_mode!=0) ? shadow_pcf(shadow_sun,shadow_sun_mvp,
+                                v_world,max(.0006,.0020*(1.0-diffuse))) : 1.0;
+    float moon_vis=(shadow_mode!=0) ? shadow_pcf(shadow_moon,shadow_moon_mvp,
+                                 v_world,max(.0006,.0018*(1.0-moonlight))) : 1.0;
+    float brightness=.37 + .52*diffuse*sun_vis + .10*moonlight*moon_vis;
     col*=brightness;
     for (int i=0; i<8; i++) {
         if(i>=lamp_count) break;
@@ -188,7 +212,20 @@ void main(){
         float r2=dot(delta,delta);
         float nearLamp=pow(max(0.0,1.0-r2/42.25),2.0);
         float facing=max(dot(n,normalize(delta)),0.0);
-        col+=vec3(.31,.19,.075)*nearLamp*(.23+.77*facing);
+        float lamp_vis=(shadow_mode!=0 && i==shadow_lamp_index) ?
+                       shadow_pcf(shadow_lamp,shadow_lamp_mvp,v_world,.0025) : 1.0;
+        col+=vec3(.31,.19,.075)*nearLamp*(.23+.77*facing)*lamp_vis;
+    }
+    // V3.9.5: small directional glints from damp patches on the trench floor.
+    // The wetness mask is WORLD-space and coherent between streamed chunks.
+    // Sun and moon geometry remain authoritative; this is not screen bloom.
+    if (v_layer==21) {
+        float damp=smoothstep(.02,.59,-terrain_pattern(v_world*.78));
+        vec3 v=normalize(camera_position-v_world);
+        vec3 half_sun=normalize(sun+v);
+        float spec=pow(max(dot(n,half_sun),0.0),36.0);
+        float wet_response=damp*.095*diffuse*sun_vis*spec;
+        col+=vec3(.65,.63,.55)*wet_response;
     }
     col=pow(max(col,vec3(0.0)),vec3(.96));
     if (v_layer==11) col=vec3(1.0,.54,.16)*1.8;
@@ -230,9 +267,6 @@ ACTOR_VERT = VERT.replace(
 # cloth silhouettes receive a soft low-angle fill (not an emissive glow).
 # No extra textures, no OpenGL feature beyond GLSL 330.
 ACTOR_FRAG = FRAG.replace(
-    'uniform float fog_strength;',
-    'uniform float fog_strength;\nuniform vec3 camera_position;'
-).replace(
     '    col*=brightness;',
     """    col*=brightness;
     if(v_layer==23 || v_layer==24) {
@@ -2558,6 +2592,13 @@ class SoldierBrain:
         self.blast_level=0
         self.blast_distance=float('inf')
         self.post_blast_caution=0.0
+        # Incoming-fire overlay: no reset or replacement of navigation FSM.
+        self.fire_timer=0.0
+        self.fire_recent=0.0
+        self.fire_count=0
+        self.fire_offset=0.0
+        self.fire_side=1
+        self.fire_urgency=0
 
     def interrupt_for_blast(self,level,distance_metres):
         """Suspend whatever navigation action is underway, without teleporting.
@@ -2578,6 +2619,40 @@ class SoldierBrain:
                     'kastar sig ned i skydd' if self.blast_level==3 else
                     'hukande i skydd vid explosion')
         return True
+
+    def receive_fire(self, from_side=1, near_miss=True):
+        """React to an ACTUAL hostile shot, never to sound-only ambience."""
+        self.fire_side=1 if from_side>=0 else -1
+        self.fire_timer=max(self.fire_timer,2.3)
+        self.fire_recent=0.0
+        self.fire_count=min(8,self.fire_count+1)
+        self.fire_urgency=2 if self.fire_count>=3 else 1
+        self.phase='beskjuten: söker skydd vid jordväggen'
+
+    def update_fire_cover(self,dt,distance,enemy_alive):
+        """Slide toward an actual navigable wall lane; no teleport/side walls."""
+        self.fire_timer=max(0.0,self.fire_timer-dt)
+        self.fire_recent+=dt
+        if not enemy_alive and self.fire_timer<=0:
+            self.fire_count=max(0,self.fire_count-1)
+        if self.fire_timer>0.0 and enemy_alive and self.state=='main':
+            desired=self.fire_side*cover_distance(distance,self.fire_side)*.83
+        else:
+            desired=0.0
+        self.fire_offset=smooth(self.fire_offset,desired,1.0-math.exp(-dt*4.2))
+
+    def combat_posture(self,enemy_visible):
+        """Recommendation only; the existing FSM retains route ownership."""
+        if self.blast_timer>0.0 or self.fire_timer<=0.0:
+            return None
+        if not enemy_visible:
+            self.phase='beskjuten: söker fri sikt från bättre skydd'
+            return 4  # Walk crouched until line of sight is useful.
+        if self.fire_urgency>=2 and self.fire_recent<.65:
+            self.phase='beskjuten: kastar sig ner för att undvika elden'
+            return 2
+        self.phase='beskjuten: knästående vid väggen, ger skottläge'
+        return 1
 
     def reset(self):
         self.__init__()
@@ -2723,6 +2798,9 @@ class SoldierBrain:
         # Reuse the same seeded obstacle target as the rendered geometry.
         # Obstacle sites are kept outside bend/junction manoeuvre regions.
         offset += obstacle_steering(s)
+        # Combat cover is an additive, smoothly time-filtered lateral request;
+        # the final clearance clamp is shared with ordinary steering.
+        offset += self.fire_offset
         if abs(offset)<1.e-9:
             return 0.0
         side=1 if offset>0 else -1
@@ -3040,28 +3118,45 @@ class SoldierBrain:
         return x,z,self._desired_heading(main_distance)
 
 def build_enemy_sculpture(mesh, shape, material):
-    """Create sculpted low-cost avatar shapes ONE time at renderer startup.
+    """Build reusable *fitted* body parts once, never per frame.
 
-    These ring profiles are independent of enemy count, frame rate and GPU
-    uploads. Indices refer to the same camouflage/uniform materials as V3.3.
+    The five shapes use smooth multi-ring silhouettes rather than chains of
+    round balls/boxes. Coordinate systems are compatible with part_model and
+    with the metres used by the shared actor_joints pose and hit regions.
     """
-    if shape == 'jacket':
-        # A narrow waist, visible shoulders, and a closed collar.
-        rings=((-0.39,.21,.145),(-.30,.24,.170),(-.05,.285,.19),
-               (.20,.335,.205),(.30,.298,.190),(.37,.176,.120))
-    elif shape == 'helmet':
-        # Military dome with a strong low rim, not an oval camo boulder.
-        rings=((-0.075,.216,.222),(-.042,.244,.242),(.012,.234,.227),
-               (.092,.202,.196),(.155,.135,.142),(.188,.044,.053))
+    if shape=='jacket':
+        # Defined y, left/right radius, front/back radius, offset from spine.
+        rings=((-0.39,.205,.139,0.),(-.29,.230,.165,-.002),
+               (-.09,.280,.184,.01),(.18,.330,.192,.015),
+               (.29,.299,.170,-.01),(.34,.160,.107,-.014))
+    elif shape=='helmet':
+        rings=((-0.065,.218,.224,.008),(-.043,.238,.244,.010),
+               (.006,.227,.228,0.),(.069,.194,.185,-.014),
+               (.124,.126,.127,-.015),(.149,.025,.030,-.018))
+    elif shape=='face':
+        # Human jaw narrower below cheekbones; rear skull remains rounded.
+        rings=((-0.178,.068,.086,-.019),(-.137,.096,.103,-.002),
+               (-.070,.126,.117,.005),(.021,.145,.145,0.),
+               (.115,.129,.126,-.008),(.164,.075,.078,-.017),
+               (.179,.014,.020,-.025))
+    elif shape=='limb':
+        rings=((-0.50,.79,.83,0.),(-.29,.94,1.00,.018),
+               (-.03,1.01,1.02,-.008),(.27,.95,.93,.008),
+               (.50,.84,.81,0.))
+    elif shape=='boot':
+        # Shape local XY/Z; sole, raised toe cap, ankle and laced instep.
+        rings=((-1.0,.86,.79,.27),(-.76,.94,1.05,.33),
+               (-.43,.96,.99,.26),(.16,.82,.72,-.12),
+               (.78,.71,.57,-.37),(1.0,.55,.42,-.41))
     else:
         raise ValueError('unknown enemy sculpture: '+str(shape))
-    facets=16
+    facets=16 if shape not in ('boot','limb') else 12
     def point(ring,index):
-        y,rx,rz=ring
+        y,rx,rz,shift=ring
         angle=math.tau*(index%facets)/facets
-        return (math.cos(angle)*rx,y,math.sin(angle)*rz)
+        return (math.cos(angle)*rx,y,shift+math.sin(angle)*rz)
     for lower,upper in zip(rings,rings[1:]):
-        v0=lower[0]*2.;v1=upper[0]*2.
+        v0=lower[0];v1=upper[0]
         for j in range(facets):
             k=(j+1)%facets
             mesh.quad(point(lower,j),point(upper,j),point(upper,k),point(lower,k),
@@ -3070,10 +3165,10 @@ def build_enemy_sculpture(mesh, shape, material):
     low,high=rings[0],rings[-1]
     for j in range(facets):
         k=(j+1)%facets
-        mesh.quad((0,low[0],0),point(low,k),point(low,j),(0,low[0],0),material,
-                  ((.5,.5),(k/facets,0),(j/facets,0),(.5,.5)))
-        mesh.quad((0,high[0],0),point(high,j),point(high,k),(0,high[0],0),material,
-                  ((.5,.5),(j/facets,1),(k/facets,1),(.5,.5)))
+        mesh.quad((0,low[0],low[3]),point(low,k),point(low,j),(0,low[0],low[3]),
+                  material,((.5,.5),(k/facets,0),(j/facets,0),(.5,.5)))
+        mesh.quad((0,high[0],high[3]),point(high,j),point(high,k),(0,high[0],high[3]),
+                  material,((.5,.5),(j/facets,1),(k/facets,1),(.5,.5)))
 
 
 class EnemyRenderer:
@@ -3081,7 +3176,7 @@ class EnemyRenderer:
 
     No per-frame OBJ loads and NO per-frame vertex buffer uploads. Each body
     part is drawn with a transform matrix using the game's existing materials
-    and lighting. A rigged GLB render adapter can replace this later.
+    and lighting. This is still procedural: true GLB skeletal animation is NEXT.
     """
     def __init__(self,ctx):
         self.ctx=ctx
@@ -3090,12 +3185,14 @@ class EnemyRenderer:
         for shape,material in (
             ('oval',10),('oval',11),('oval',23),('oval',24),('oval',25),
             ('cube',10),('cube',24),('jacket',23),('helmet',24),
+            ('face',25),('boot',10),('limb',23),
             ('cylinder',10),('cylinder',13),('cylinder',23),('cylinder',24),('cylinder',25)
         ):
             mesh=MeshBuilder()
             if shape=='oval':blob(mesh,(0.,0.,0.),(1.,1.,1.),material,18,9,1.4)
             elif shape=='cube':box(mesh,(0.,0.,0.),(2.,2.,2.),material)
-            elif shape in ('jacket','helmet'):build_enemy_sculpture(mesh,shape,material)
+            elif shape in ('jacket','helmet','face','boot','limb'):
+                build_enemy_sculpture(mesh,shape,material)
             else:bar(mesh,(0.,-.5,0.),(0.,.5,0.),1.,material,12,1.)
             data=mesh.as_array()
             buffer=ctx.buffer(data.tobytes())
@@ -3104,6 +3201,8 @@ class EnemyRenderer:
             self.meshes[(shape,material)]=(buffer,vao)
         self.program['materials']=0
         self.program['material_normals']=1
+        self.program['sun_direction'].value=SUN_DIRECTION
+        self.program['moon_direction'].value=MOON_DIRECTION
         try:self.lamp_uniform=self.program['lamp_positions']
         except KeyError:self.lamp_uniform=self.program['lamp_positions[0]']
 
@@ -3115,7 +3214,7 @@ class EnemyRenderer:
         model[:3,:3]=np.array(((c,0.,s),(0.,1.,0.),(-s,0.,c)),dtype='f4')
         model[:3,3]=pos
         local=np.eye(4,dtype='f4')
-        if part[0]=='cylinder':
+        if part[0] in ('cylinder','limb'):
             a=np.array(part[2],dtype='f4'); b=np.array(part[3],dtype='f4')
             direction=b-a
             length=float(np.linalg.norm(direction))
@@ -3130,17 +3229,39 @@ class EnemyRenderer:
         else:
             scale=np.diag(np.asarray(part[3],dtype='f4'))
             if len(part)>4:
-                pitch=float(part[4])
+                # Float = legacy death pitch; tuple = head yaw / full local
+                # orientation. OpenGL receives same rigid matrix as before.
+                angles=part[4]
+                pitch,yaw,roll=((float(angles),0.,0.) if isinstance(angles,(float,int))
+                                else tuple(float(v) for v in angles))
                 cp,sp=math.cos(pitch),math.sin(pitch)
-                rotation=np.array(((1.,0.,0.),(0.,cp,-sp),(0.,sp,cp)),dtype='f4')
-                local[:3,:3]=rotation@scale
+                cy,sy=math.cos(yaw),math.sin(yaw)
+                cr,sr=math.cos(roll),math.sin(roll)
+                rx=np.array(((1.,0.,0.),(0.,cp,-sp),(0.,sp,cp)),dtype='f4')
+                ry=np.array(((cy,0.,sy),(0.,1.,0.),(-sy,0.,cy)),dtype='f4')
+                rz=np.array(((cr,-sr,0.),(sr,cr,0.),(0.,0.,1.)),dtype='f4')
+                local[:3,:3]=ry@rx@rz@scale
             else:
                 local[:3,:3]=scale
             local[:3,3]=part[2]
         return model@local
 
+    def collect_instances(self,agents,position_at,heading_at):
+        """Compute the same animated actor transforms for camera and shadow passes.
+
+        NEVER move hitboxes/AI from this renderer: only share matrices to
+        avoid costly per-pass Python recomputation of ~70 body/weapon parts.
+        """
+        instances=[]
+        for agent in agents:
+            pos=position_at(agent.spec)
+            heading=actor_facing(agent,heading_at(agent.route_m))
+            for part in enemy_parts(agent):
+                instances.append(((part[0],part[1]),self.part_model(pos,heading,part)))
+        return instances
+
     def draw(self,agents,position_at,heading_at,projection_view,eye,
-             fog_strength,normal_enabled,lights):
+             fog_strength,normal_enabled,lights,instances=None):
         prg=self.program
         prg['mvp'].write(np.asarray(projection_view,dtype='f4').T.tobytes())
         prg['camera_position'].value=eye
@@ -3149,18 +3270,28 @@ class EnemyRenderer:
         prg['lamp_count'].value=len(lights)
         if lights:
             self.lamp_uniform.write(np.asarray(lights+[(0.,0.,0.)]*(8-len(lights)),dtype='f4').tobytes())
-        for agent in agents:
-            pos=position_at(agent.spec)
-            heading=actor_facing(agent,heading_at(agent.route_m))
-            for part in enemy_parts(agent):
-                vao=self.meshes[(part[0],part[1])][1]
-                model=self.part_model(pos,heading,part)
-                prg['model'].write(model.T.tobytes())
-                vao.render(moderngl.TRIANGLES)
+        if instances is None:
+            instances=self.collect_instances(agents,position_at,heading_at)
+        for key,model in instances:
+            vao=self.meshes[key][1]
+            prg['model'].write(model.T.tobytes())
+            vao.render(moderngl.TRIANGLES)
 
     def release(self):
         for vbo,vao in self.meshes.values():vao.release();vbo.release()
         self.program.release()
+
+
+
+def _rig_shape_template(shape,material):
+    """Shared CPU sculpt template for the one-time V3.9.3 GPU rig bind."""
+    mesh=MeshBuilder()
+    if shape=='oval':blob(mesh,(0.,0.,0.),(1.,1.,1.),material,18,9,1.4)
+    elif shape=='cube':box(mesh,(0.,0.,0.),(2.,2.,2.),material)
+    elif shape in ('jacket','helmet','face','boot','limb'):
+        build_enemy_sculpture(mesh,shape,material)
+    else:bar(mesh,(0.,-.5,0.),(0.,.5,0.),1.,material,12,1.)
+    return mesh.as_array()
 
 
 class StartupScreen:
@@ -3256,6 +3387,9 @@ class Trench:
         self.prog['use_pbr_normals']=int(self.has_pbr_normals)
         self.fog_strength=FOG_DENSITY
         self.prog['fog_strength'].value=self.fog_strength
+        for prg in (self.prog,):
+            prg['sun_direction'].value=SUN_DIRECTION
+            prg['moon_direction'].value=MOON_DIRECTION
         self.prog['time_seconds'].value=0.0
         self.prog['lamp_count'].value=0
         # Driver/ModernGL versions disagree on array uniform member names.
@@ -3263,7 +3397,46 @@ class Trench:
         try:self.lamp_uniform=self.prog['lamp_positions']
         except KeyError:self.lamp_uniform=self.prog['lamp_positions[0]']
         self.enemies=EnemyDirector()
-        self.enemy_renderer=EnemyRenderer(self.ctx)
+        self.arcade=ArcadeRun(_seed=SEED)
+        self.death_screen=DeathScreen(self.ctx)
+        self.death_age=0.0
+        self.last_player_eye=None
+        self.player_visibility={}
+        self.enemy_shots_on_last_update=()
+        self.player_can_shoot={}
+        self.visible_opportunity_seconds={}
+        self.hostile_shot_counts={}
+        # Sight queries cost milliseconds in dense trench geometry. Sample
+        # perception at a bounded rate, but recheck WORLD LOS on each shot.
+        self.perception_timer=0.0
+        self.footstep_alert_timer=0.0
+        # Prefer GPU skinning: ONE draw call per 16-bone soldier rather than
+        # ~60 distinct body pieces per soldier per lighting pass. Keep the
+        # previous renderer available if a driver rejects the skinning shaders.
+        try:
+            self.enemy_renderer=SkeletalEnemyRenderer(
+                self.ctx,_rig_shape_template,EnemyRenderer.part_model,
+                ACTOR_FRAG,SUN_DIRECTION,MOON_DIRECTION)
+            print(f'V3.9.5: GPU-skelett 16 ben, tre utrustningsvarianter, '
+                  f'{self.enemy_renderer.gpu_bytes/1024/1024:.1f} MiB resident')
+        except Exception as exc:
+            print(f'GPU-skelett kan inte startas, legacy-soldat används: '
+                  f'{type(exc).__name__}: {exc}',file=sys.stderr)
+            self.enemy_renderer=EnemyRenderer(self.ctx)
+        self.pose_lab_index=-1
+        self.pose_lab_dummy=EnemyAgent(EnemySpec(-999,5.0,0.0,'cover'))
+        # Separate renderer: depth-only draw never affects geometry, AI or hitboxes.
+        # Fall back to V3.9.1 lighting on OpenGL driver/resource failure.
+        self.shadow_renderer=None
+        try:
+            self.shadow_renderer=ShadowRenderer(self.ctx,SUN_DIRECTION,MOON_DIRECTION)
+            self.shadow_renderer.setup_material(self.prog)
+            self.shadow_renderer.setup_material(self.enemy_renderer.program)
+            print('V3.9.2: skuggkartor för sol, måne och närmaste lampa (F12 AV/PÅ)')
+        except Exception as exc:
+            print(f'Skuggor kunde inte startas: {type(exc).__name__}: {exc}',file=sys.stderr)
+            self.prog['shadow_mode'].value=0
+            self.enemy_renderer.program['shadow_mode'].value=0
         # World-only VFX: explosions never alter terrain/AI/hit resolution.
         # Renderer allocates GPU geometry ONCE and reuses it every frame.
         self.battlefield=BattlefieldEventDirector(seed=SEED)
@@ -3276,6 +3449,15 @@ class Trench:
         try:pygame.mouse.set_cursor(pygame.SYSTEM_CURSOR_CROSSHAIR)
         except Exception:pass
         self.chunks={}
+        # Main-thread-only, bounded CPU mesh cache. Saves expensive rebuilds
+        # when scrubbing backwards and forwards through the same regions.
+        self.mesh_cache=OrderedDict()
+        self.chunk_failures={}
+        self.chunk_retry_after={}
+        self.debug_jump_target=None
+        self.debug_jump_requested_at=0.0
+        self.debug_jump_stream_chunk=None
+        self.debug_jump_saved_chunks=set()
         self.todo=queue.Queue(maxsize=16)
         self.ready=queue.Queue(maxsize=16)
         self.pending=set()
@@ -3354,6 +3536,13 @@ class Trench:
             if normal is not None and source==color and normal.is_file():
                 chosen_normal=normal
                 loaded_normal+=1
+            elif index in enemy_names and source==fallback:
+                # Matched locally authored OpenGL normal maps for soldier cloth.
+                # Zero extras are required to boot an existing V3.9.1 install.
+                soldier_normal=ROOT/'assets'/'enemies'/(enemy_names[index]+'_nor_gl.png')
+                if soldier_normal.is_file():
+                    chosen_normal=soldier_normal
+                    loaded_local_normals+=1
             elif 13<=index<20 and source==fallback:
                 # Never pair a downloaded photographic albedo with an unrelated
                 # procedural fallback normal map.
@@ -3380,19 +3569,26 @@ class Trench:
               f'{loaded_local_normals} bundled detail normals; 26 layers total')
         return tex,ntex,have_normals
 
+    def _remember_mesh(self,index,data):
+        """Remember only a few immutable CPU meshes, never OpenGL objects."""
+        self.mesh_cache[index]=data
+        self.mesh_cache.move_to_end(index)
+        while len(self.mesh_cache)>MESH_CACHE_CHUNKS:
+            self.mesh_cache.popitem(last=False)
+
     def chunk(self,index,data=None):
+        # Cached mesh uploads never trigger slow synchronous CPU generation.
         if data is None:
-            data=make_chunk(index*CHUNK_LEN)
+            data=self.mesh_cache.get(index)
+            if data is None:
+                data=make_chunk(index*CHUNK_LEN)
         vbo=self.ctx.buffer(data.tobytes())
         vao=self.ctx.vertex_array(self.prog,[(vbo,'3f 3f 2f 1f','in_pos','in_normal','in_uv','in_layer')])
+        self._remember_mesh(index,data)
         return (vbo,vao,len(data))
 
     def _publish_chunk_result(self,generation,index,data):
-        """Backpressure must NEVER lose a completed chunk while it is pending.
-
-        A full ready queue simply waits for the main thread to drain one item.
-        Stop and generation change both cancel old deliveries promptly.
-        """
+        """Never drop completed work because the bounded delivery queue is full."""
         while not self.worker_stop.is_set() and generation==self.generation:
             try:
                 self.ready.put((generation,index,data),timeout=.15)
@@ -3416,55 +3612,83 @@ class Trench:
                 self._publish_chunk_result(generation,index,data)
 
     def _invalidate_chunk_generation(self):
-        """Discard obsolete far-away work before a user-requested restart.
-
-        An in-flight worker can finish its old CPU calculation, but generation
-        checks ensure it is never uploaded or treated as current. No OpenGL
-        objects are touched by this method or by the worker thread.
-        """
+        """Cancel queued jobs, not GPU geometry; workers never touch OpenGL."""
         self.generation+=1
         self.pending.clear()
+        self.chunk_failures.clear()
+        self.chunk_retry_after.clear()
         for work in (self.todo,self.ready):
             while True:
                 try:work.get_nowait()
                 except queue.Empty:break
 
-    def keep_chunks(self):
-        current=max(0,math.floor(self.distance/CHUNK_LEN))
-        wanted=set(range(max(0,current-RETAIN_BEHIND),current+PREFETCH_AHEAD+1))
-        # Process at most one completed upload each frame, minimizing GPU stalls.
+    def _jump_required_chunks(self,route_metres):
+        core=max(0,int(math.floor(route_metres/CHUNK_LEN)))
+        return {i for i in (core-1,core,core+1) if i>=0}
+
+    def _jump_ready_progress(self):
+        target=self.debug_jump_target
+        if target is None:return (0,0)
+        required=self._jump_required_chunks(target)
+        return (len(required.intersection(self.chunks)),len(required))
+
+    def _deliver_ready_chunks(self,wanted):
+        """Perform at most one GPU upload each frame; preserve generation IDs."""
+        uploaded=0
         for _ in range(UPLOADS_PER_FRAME):
             try: gen,index,data=self.ready.get_nowait()
             except queue.Empty:break
-            # A stale reply after R must not clear the NEW generation's job
-            # for the same chunk id (otherwise duplicate jobs are scheduled).
-            if gen!=self.generation:
-                continue
+            if gen!=self.generation:continue
             self.pending.discard(index)
-            if index in wanted and index not in self.chunks and data is not None:
-                start=time.perf_counter()
-                self.chunks[index]=self.chunk(index,data)
-                self.chunk_upload_ms=(time.perf_counter()-start)*1000
+            if data is None:
+                self.chunk_failures[index]=self.chunk_failures.get(index,0)+1
+                if self.chunk_failures[index]>=JUMP_MESH_RETRIES:
+                    self.chunk_retry_after[index]=time.monotonic()+CHUNK_FAILURE_BACKOFF_SECONDS
+                    print(f'CHUNK ERROR: {index} failed repeatedly; holding world and retrying after cooldown',file=sys.stderr)
+                continue
+            if index not in wanted or index in self.chunks:
+                continue
+            start=time.perf_counter()
+            self.chunks[index]=self.chunk(index,data)
+            self.chunk_upload_ms=(time.perf_counter()-start)*1000
+            uploaded+=1
+        return uploaded
+
+    def _load_cached_chunks(self,wanted,priority,uploaded):
+        """Fast GPU-only cache restore under the same per-frame upload budget."""
+        for index in priority:
+            if uploaded>=UPLOADS_PER_FRAME:break
+            if index in wanted and index not in self.chunks and index not in self.pending:
+                data=self.mesh_cache.get(index)
+                if data is not None:
+                    start=time.perf_counter()
+                    self.chunks[index]=self.chunk(index,data)
+                    self.chunk_upload_ms=(time.perf_counter()-start)*1000
+                    uploaded+=1
+        return uploaded
+
+    def _schedule_missing_chunks(self,priority):
+        for i in priority:
+            if i in self.chunks or i in self.pending or i in self.mesh_cache:
+                continue
+            if self.chunk_failures.get(i,0)>=JUMP_MESH_RETRIES:
+                if time.monotonic()<self.chunk_retry_after.get(i,float('inf')):
+                    continue
+                self.chunk_failures.pop(i,None)
+                self.chunk_retry_after.pop(i,None)
+                print(f'CHUNK RETRY: bygg om sektion {i} efter timeout')
+            try:self.todo.put_nowait((self.generation,i))
+            except queue.Full:break
+            self.pending.add(i)
+
+    def _evict_chunks_except(self,wanted):
         for i in list(self.chunks):
             if i not in wanted:
-                vbo,vao,_=self.chunks.pop(i);vao.release();vbo.release()
-        # Prefetch closest missing chunks first. Worker never uses OpenGL.
-        order=sorted(wanted,key=lambda x:(abs(x-current),x))
-        for i in order:
-            if i not in self.chunks and i not in self.pending:
-                try:self.todo.put_nowait((self.generation,i))
-                except queue.Full:break
-                self.pending.add(i)
+                vbo,vao,_=self.chunks.pop(i)
+                vao.release();vbo.release()
 
-    def debug_jump(self,delta):
-        """Developer-only world scrub: exact route metres, NEVER a shot event.
-
-        Recreates tactical context at the new location but retains the same
-        procedural SEED. Does not mark bypassed enemies as eliminated.
-        """
-        target=max(0.0,self.distance+float(delta))
-        if abs(target-self.distance)<1e-6:return target
-        self._invalidate_chunk_generation()
+    def _finish_debug_jump(self,target):
+        """Only change camera/AI after the landing's real 3D meshes are ready."""
         self.distance=target
         self.speed=0.0
         self.step_distance=target
@@ -3479,6 +3703,15 @@ class Trench:
         self.terrain_eye_base=floor_y(target,0.0)
         self.brain.reset()
         self.enemies.reset()
+        self.arcade.reset()  # clear previous combat before reproducible debug test
+        self.death_age=0.0
+        self.last_player_eye=None
+        self.player_visibility.clear()
+        self.player_can_shoot.clear()
+        self.visible_opportunity_seconds.clear()
+        self.hostile_shot_counts.clear()
+        self.perception_timer=0.0
+        self.footstep_alert_timer=0.0
         self.enemy_death_pause=0.0
         self.last_enemy_frame=None
         self.last_camera_viewproj=None
@@ -3486,9 +3719,65 @@ class Trench:
         self.mode=5
         self.paused=False
         self.last_dt=0.0
-        # The next frame queues only the new local chunks; no expensive
-        # synchronous world rebuild in the Pygame event handler.
-        print(f'DEBUG: hopp till {target:.1f} m (samma seed; encounter reset)')
+        self.debug_jump_target=None
+        self.debug_jump_stream_chunk=None
+        self.debug_jump_saved_chunks.clear()
+        print(f'DEBUG: landat på {target:.1f} m med färdig terräng (samma seed)')
+
+    def keep_chunks(self):
+        """Normal prefetch or atomic debug landing; never display an empty jump."""
+        target=self.debug_jump_target
+        if target is not None:
+            # Autorepeated keys adjust the queued destination without moving
+            # the camera or repeatedly invalidating background mesh work.
+            required=self._jump_required_chunks(target)
+            if time.monotonic()-self.debug_jump_requested_at<JUMP_KEY_SETTLE_SECONDS:
+                saved=self.debug_jump_saved_chunks | required
+                self._deliver_ready_chunks(saved)
+                return
+            core=int(target//CHUNK_LEN)
+            if required.issubset(self.chunks):
+                self._finish_debug_jump(target)
+            else:
+                if self.debug_jump_stream_chunk!=core:
+                    # One new generation per settled landing CHUNK, not key.
+                    self._invalidate_chunk_generation()
+                    self.debug_jump_stream_chunk=core
+                    print(f'DEBUG: förbereder landning {target:.0f} m, chunk {core}')
+                wanted=self.debug_jump_saved_chunks | required
+                priority=[core,core+1]+([core-1] if core>0 else [])
+                # Preserve old visible world until landing is complete.
+                self._evict_chunks_except(wanted)
+                uploaded=self._deliver_ready_chunks(wanted)
+                self._load_cached_chunks(wanted,priority,uploaded)
+                if required.issubset(self.chunks):
+                    self._finish_debug_jump(target)
+                else:
+                    self._schedule_missing_chunks(priority)
+                    return
+
+        current=max(0,math.floor(self.distance/CHUNK_LEN))
+        wanted=set(range(max(0,current-RETAIN_BEHIND),current+PREFETCH_AHEAD+1))
+        priority=sorted(wanted,key=lambda x:(abs(x-current),x))
+        uploaded=self._deliver_ready_chunks(wanted)
+        self._evict_chunks_except(wanted)
+        self._load_cached_chunks(wanted,priority,uploaded)
+        self._schedule_missing_chunks(priority)
+
+    def debug_jump(self,delta):
+        """Queue an atomic debug scrub; keys can be autorepeated to any range.
+
+        The camera and game progress remain fixed until real geometry for the
+        entire landing neighbourhood has arrived. Only debug controls use this.
+        """
+        base=self.distance if self.debug_jump_target is None else self.debug_jump_target
+        target=max(0.0,base+float(delta))
+        if abs(target-base)<1e-6:return target
+        if self.debug_jump_target is None:
+            self.debug_jump_saved_chunks=set(self.chunks)
+        self.debug_jump_target=target
+        self.debug_jump_requested_at=time.monotonic()
+        print(f'DEBUG: begärt hopp till {target:.0f} m; väntar på terräng')
         return target
 
     def enemy_position(self,spec):
@@ -3497,8 +3786,36 @@ class Trench:
         director=getattr(self,'enemies',None)
         agent=director.active.get(spec.enemy_id) if director is not None else None
         route_m=(agent.route_m if agent is not None else spec.route_m)
-        x,z=sides(route_m,spec.lateral)
-        return (x,floor_y(route_m,spec.lateral),z)
+        lateral=spec.lateral+(agent.lateral_offset if agent is not None else 0.0)
+        if agent is not None and not agent.dead:
+            # Navigation belongs to the deterministic route/obstacle system,
+            # not to animation root motion. Follow camera steering, then allow
+            # for a soldier's BODY width rather than only the camera eye.
+            lateral+=obstacle_steering(route_m)
+            for ob in obstacles_in_range(route_m-3.2,route_m+3.2):
+                if ob.kind not in ('crate','rubble') or not ob.detour:
+                    continue
+                # Standing human shoulder/pack half-width ~0.32m. An actor
+                # must clear the actual rendered obstacle, not pass its centre.
+                safe=ob.width*.5+.34
+                sign=1 if ob.detour>ob.lateral else -1
+                desired=ob.lateral+sign*safe
+                lo=-(wall_width(route_m,-1)-.36)
+                hi=wall_width(route_m,1)-.36
+                if not lo<=desired<=hi:
+                    alternate=ob.lateral-sign*safe
+                    desired=alternate if lo<=alternate<=hi else max(lo,min(hi,desired))
+                travel=abs(route_m-ob.s)
+                outer=ob.length*.5+2.3
+                inner=ob.length*.5+.18
+                influence=eased((outer-travel)/max(.01,outer-inner))
+                lateral+=(desired-lateral)*influence
+        # All tactical displacements are bounded by the SAME corridor geometry.
+        side=1 if lateral>=0 else -1
+        limit=max(.0,wall_width(route_m,side)-.36)
+        lateral=max(-limit,min(limit,lateral))
+        x,z=sides(route_m,lateral)
+        return (x,floor_y(route_m,lateral),z)
 
     def _enemy_shot_occluded(self,agent,t,origin,direction,route_at_shot=None,
                              enemy_route_at_shot=None):
@@ -3561,8 +3878,11 @@ class Trench:
         NOT call this before physical verification or map camera pixels here.
         Standalone mouse/T keys are marked as simulated input only.
         """
+        if self.debug_jump_target is not None:
+            return None  # never fire against a frame from the OLD world
+        if getattr(self,'pose_lab_index',-1)>=0:return None  # F1 diagnostic is not gameplay
         frame=self.last_enemy_frame if frame is None else frame
-        if frame is None:return None
+        if frame is None or not self.arcade.alive:return None
         actor_routes=dict(frame.actor_routes)
         result=self.enemies.resolve_frozen_hit(float(x),float(y),frame,
             lambda agent,t,origin,direction:self._enemy_shot_occluded(
@@ -3570,6 +3890,7 @@ class Trench:
                 enemy_route_at_shot=actor_routes.get(agent.spec.enemy_id)))
         # Any player gunfire can be heard by main-route patrols, regardless
         # of hit/miss. Hearing never fakes a physical hit or eliminates anyone.
+        self.arcade.player_shot(result)
         heard=self.enemies.hear_shot(self.distance)
         if heard:print(f'FIENDER HÖR SKOTT: {heard}')
         if result:
@@ -3600,12 +3921,14 @@ class Trench:
             if event.type==pygame.VIDEORESIZE:
                 self.frame_size=(max(400,event.w),max(260,event.h))
             if event.type==pygame.MOUSEBUTTONDOWN and event.button==1:
-                self.submit_game_hit(*event.pos,source='mouse_simulated')
+                if self.arcade.alive and not self.paused:
+                    self.submit_game_hit(*event.pos,source='mouse_simulated')
                 continue
             if event.type!=pygame.KEYDOWN:continue
             if event.key==pygame.K_t:
-                ww,hh=pygame.display.get_surface().get_size()
-                self.submit_game_hit(ww//2,hh//2,source='keyboard_simulated')
+                if self.arcade.alive and not self.paused:
+                    ww,hh=pygame.display.get_surface().get_size()
+                    self.submit_game_hit(ww//2,hh//2,source='keyboard_simulated')
             elif event.key==pygame.K_ESCAPE:self.running=False
             elif event.key in (pygame.K_F9, pygame.K_F10):
                 if self._projector_window is not None:
@@ -3615,6 +3938,19 @@ class Trench:
                     except Exception as exc:
                         print(f'Kunde inte flytta fönstret: {exc}')
                         self._projector_window=None
+            elif event.key==getattr(pygame,'K_F1',-111):
+                self.pose_lab_index+=1
+                if self.pose_lab_index>=len(POSE_LAB):self.pose_lab_index=-1
+                status=(POSE_LAB[self.pose_lab_index] if self.pose_lab_index>=0 else 'AV')
+                # Preview each gesture from phase zero, not an arbitrary point
+                # in the previous gesture's cycle. Reset affects demo only.
+                self.pose_lab_dummy.total_time=0.0
+                self.pose_lab_dummy.state_time=0.0
+                print('V3.9.5 F1 SKELETTTEST:',status)
+            elif event.key==getattr(pygame,'K_F12',-120):
+                if self.shadow_renderer is not None:
+                    self.shadow_renderer.enabled=not self.shadow_renderer.enabled
+                    print('F12: skuggor', 'PÅ' if self.shadow_renderer.enabled else 'AV')
             elif event.key==pygame.K_F11:
                 self.profile_enabled=not self.profile_enabled
                 self.profile_samples.clear()
@@ -3645,6 +3981,9 @@ class Trench:
             elif event.key==pygame.K_DOWN:self.debug_jump(-25.0)
             elif event.key in (pygame.K_SPACE,pygame.K_p):self.paused=not self.paused
             elif event.key==pygame.K_r:
+                self.debug_jump_target=None
+                self.debug_jump_stream_chunk=None
+                self.debug_jump_saved_chunks.clear()
                 # A full deterministic restart: cancel old prefetch jobs,
                 # reset first-person pose, and make the start geometry visible.
                 self._invalidate_chunk_generation()
@@ -3668,6 +4007,16 @@ class Trench:
                 self.obstacle_camera_lift=0.0
                 self.terrain_eye_base=floor_y(0.,0.)
                 self.enemies.reset()
+                self.arcade.reset()
+                self.death_age=0.0
+                self.last_player_eye=None
+                self.player_visibility.clear()
+                self.player_can_shoot.clear()
+                self.visible_opportunity_seconds.clear()
+                self.hostile_shot_counts.clear()
+                self.pose_lab_index=-1
+                self.perception_timer=0.0
+                self.footstep_alert_timer=0.0
                 self.battlefield.reset()
                 self.last_camera_viewproj=None
                 self.last_enemy_frame=None
@@ -3683,16 +4032,132 @@ class Trench:
             elif pygame.K_1<=event.key<=pygame.K_9:
                 self.auto=False;self.mode=event.key-pygame.K_1
     def update(self,dt):
+        if self.debug_jump_target is not None:
+            # A staging jump freezes gameplay, hit timers and virtual movement.
+            # The old terrain stays rendered while its replacement is built.
+            self.last_dt=0.0
+            return
         # Camera has historically used the __init__ default (1/60) forever.
         # At 400 FPS this made heading/lean converge far too quickly, while
         # speed/position used real dt. Keep visual and navigation clocks equal.
         self.last_dt=0.0 if self.paused else max(0.0,min(.055,float(dt)))
+        if getattr(self,'pose_lab_index',-1)>=0:
+            self.elapsed+=dt
+            self.pose_lab_dummy.total_time+=dt
+            self.pose_lab_dummy.state_time+=dt
+            return
         if self.paused:return
+        if not self.arcade.alive:
+            self.death_age+=dt
+            return
         self.elapsed+=dt
         keys=pygame.key.get_pressed()
         self.look+=(float(keys[pygame.K_d])-float(keys[pygame.K_a]))*dt*.75
         self.look*=math.exp(-1.7*dt)
-        self.enemies.update(dt,self.distance)
+        # Compute sight from the virtual first-person BODY, not the projector.
+        # Reuse last presented eye position; next rendered frame refreshes it.
+        eye=(self.last_player_eye if self.last_player_eye is not None else
+             self._initial_player_eye())
+        body=player_body(eye,self.height)
+        geo=dict(route=route,sides=sides,wall_width=wall_width,
+                 wall_height=wall_height,floor_y=floor_y,
+                 obstacles_in_range=obstacles_in_range)
+        self.perception_timer-=dt
+        perception_due=self.perception_timer<=0.0
+        if perception_due:
+            # The CPU ray tests run around 15 times/second, not once per
+            # 300–400 FPS render. AI pose/aim continues updating every frame.
+            self.perception_timer=.065
+            self.player_visibility.clear()
+            self.player_can_shoot.clear()
+        # The opportunity comes from the LAST PRESENTED frame, never an
+        # imagined future pose. Remove expired IDs on each perception tick.
+        if perception_due:
+            active_ids={idx for idx,a in self.enemies.active.items() if not a.dead}
+            for idx in list(self.visible_opportunity_seconds):
+                if idx not in active_ids:self.visible_opportunity_seconds.pop(idx,None)
+            for idx in active_ids:
+                self.player_can_shoot[idx]=enemy_shown_to_player(
+                    self.last_enemy_frame,idx,eye,geometry=geo)
+        for idx,shown in self.player_can_shoot.items():
+            prev=self.visible_opportunity_seconds.get(idx,0.0)
+            self.visible_opportunity_seconds[idx]=(
+                min(8.0,prev+dt) if shown else max(0.0,prev-dt*.65))
+        def visibility(agent):
+            if agent.spec.enemy_id not in self.player_visibility:
+                px,ground,pz=self.enemy_position(agent.spec)
+                origin=(px,ground+1.48,pz)
+                visible=can_see_body(origin,body,agent.route_m,self.distance,**geo)
+                self.player_visibility[agent.spec.enemy_id]=visible
+            if not self.player_visibility[agent.spec.enemy_id]:
+                return False
+            # Initial discovery requires the soldier to face the player.
+            # An already-engaged actor retains its contact while turning.
+            if agent.state in ('idle','investigating','alert'):
+                pos=self.enemy_position(agent.spec)
+                facing=actor_facing(agent,route(agent.route_m)[2])
+                return enemy_faces_player(pos,eye,facing)
+            return True
+        self.enemies.update(dt,self.distance,can_see_player=visibility)
+        for enemy_id in self.enemies.gunshots_this_frame:
+            enemy=self.enemies.active.get(enemy_id)
+            if enemy is None or enemy.dead:continue
+            px,ground,pz=self.enemy_position(enemy.spec)
+            # Never allow a sampled perception cache to authorize lethal fire.
+            # Always re-evaluate geometry at the actual hostile-shot event.
+            fresh_eye=self.enemy_position(enemy.spec)
+            current_body=player_body(eye,self.height)
+            shots_visible=can_see_body((fresh_eye[0],fresh_eye[1]+1.48,fresh_eye[2]),
+                current_body,enemy.route_m,self.distance,**geo)
+            clear=bool(shots_visible)
+            self.player_visibility[enemy_id]=shots_visible
+            cfg=difficulty_at(self.distance)
+            count=self.hostile_shot_counts.get(enemy_id,0)
+            self.hostile_shot_counts[enemy_id]=count+1
+            # Lethal contact requires BOTH world LOS and a real prior on-screen
+            # opportunity, sufficient response time AND warning rounds.
+            fair=(self.player_can_shoot.get(enemy_id,False) and
+                  self.visible_opportunity_seconds.get(enemy_id,0.0)>=cfg.reaction_grace and
+                  count>=cfg.warning_shots)
+            died=self.arcade.enemy_shot(enemy_id,clear_sight=clear,
+                distance_metres=math.hypot(px-eye[0],pz-eye[2]),
+                exposure=min(1.0,len(shots_visible)/3.0),
+                allow_damage=fair,progress_metres=self.distance)
+            if clear and self.auto:
+                # Shelter response belongs to SoldierBrain, independent of
+                # whether the random hit/miss roll happened to be lethal.
+                self.brain.receive_fire(from_side=-1 if enemy.spec.lateral>=0 else 1)
+            if clear and not died:
+                # This is a bounded visual impact CUE near a bank, NOT
+                # simulated bullet penetration or persistent terrain damage.
+                nearby=tuple(ob for ob in obstacles_in_range(
+                    self.distance-.8,self.distance+2.6)
+                    if ob.kind in ('crate','rubble','sandbags','timber'))
+                if nearby:
+                    ob=min(nearby,key=lambda item:abs(item.s-self.distance))
+                    bx,bz=sides(ob.s,ob.lateral)
+                    by=floor_y(ob.s,ob.lateral)+min(.74,max(.12,ob.height*.70))
+                    splash=MATERIALS[ob.kind].splash
+                else:
+                    flank=-1 if (enemy_id+self.arcade.incoming_shots)%2 else 1
+                    bank_offset=flank*max(.52,wall_width(self.distance,flank)-.08)
+                    bx,bz=sides(self.distance+1.15,bank_offset)
+                    by=floor_y(self.distance+1.15,bank_offset)+.72
+                    splash='earth'
+                self.battlefield.bullet_splash((bx,by,bz),material=splash)
+            if died:
+                self.speed=0.0
+                self.hit_notification='DU ÄR DÖD'
+                print('ARCADE:',self.arcade.status())
+                return
+        # Footsteps only reach nearby patrols. Gunshots retain a much larger
+        # hearing distance. This prevents the first enemy sprinting from 32m
+        # toward the player while still invisibly behind the first bank.
+        self.footstep_alert_timer=max(0.0,self.footstep_alert_timer-dt)
+        if self.speed>=2.1 and self.footstep_alert_timer==0.0:
+            alerted=self.enemies.hear_shot(self.distance,max_range=12.0)
+            if alerted:print(f'FIENDER HÖR SPRINGSTEG: {alerted}')
+            self.footstep_alert_timer=1.4
         self.enemy_death_pause=max(0.0,self.enemy_death_pause-dt)
         # Battlefield geometry remains visual-only. Actual DETONATIONS emit
         # a one-frame actor cue; never trigger reaction on artillery scheduling.
@@ -3720,15 +4185,22 @@ class Trench:
             self.mode=self.brain.choose(self.distance,dt)
             threat=self.enemies.current_threat(self.distance)
             if threat is not None and self.distance>=threat.route_m-8.05:
-                # Live enemies are still PLAYER-ONLY. A nearby blast may put
-                # the observing soldier prone, but never resolves the threat.
-                if self.brain.blast_timer<=0.0:
+                if self.brain.blast_timer>0.0:
+                    if self.brain.blast_level==3:self.mode=2
+                    elif self.brain.blast_level==2:self.mode=1
+                elif self.player_can_shoot.get(threat.spec.enemy_id,False):
                     self.mode=1
-                    self.brain.phase='KONTAKT: spelaren måste eliminera hotet'
-                elif self.brain.blast_level==3:
-                    self.mode=2
-                elif self.brain.blast_level==2:
-                    self.mode=1
+                    self.brain.phase='KONTAKT: FIENDE I SYNLIGT SKOTTLÄGE'
+                else:
+                    # Enemies behind a bend are not a stationary kill-clock.
+                    # The soldier keeps seeking a real shooting opportunity.
+                    self.mode=4
+                    self.brain.phase='söker bättre skjutvinkel förbi skydd'
+            self.brain.update_fire_cover(dt,self.distance,threat is not None)
+            response=self.brain.combat_posture(
+                bool(threat and self.player_can_shoot.get(threat.spec.enemy_id,False)))
+            if response is not None and threat is not None and self.brain.blast_timer<=0:
+                self.mode=response
             if self.brain.post_blast_caution>0.0 and self.mode>=5:
                 self.mode=4  # cautious resumption; preserves real route/nav state
             if self.enemy_death_pause>0.0 and self.brain.blast_timer<=0.0:
@@ -3743,7 +4215,11 @@ class Trench:
             advanced=0.0  # do not drift through wall/corner while crouching
         if self.auto:
             if self.brain.state=='main':
-                advanced=self.enemies.clamp_advance(self.distance,advanced)
+                threat=self.enemies.current_threat(self.distance)
+                if threat is not None and not self.player_can_shoot.get(threat.spec.enemy_id,False):
+                    advanced=min(advanced,max(0.0,threat.route_m-3.5-self.distance))
+                else:
+                    advanced=self.enemies.clamp_advance(self.distance,advanced)
             self.distance,moved=self.brain.advance(self.distance,advanced)
             self.step_distance+=moved
             self.last_moved=moved
@@ -3757,6 +4233,12 @@ class Trench:
         self.height=smooth(self.height,height,1-math.exp(-dt*stance_rate))
         lift=self.brain.step_lift if self.auto else 0.0
         self.obstacle_camera_lift=smooth(self.obstacle_camera_lift,lift,1-math.exp(-dt*7.5))
+        self.arcade.step(dt,self.distance)
+
+    def _initial_player_eye(self):
+        px,pz,_=(self.brain.camera_pose(self.distance) if self.auto
+                  else route(self.distance))
+        return (px,floor_y(self.distance)+self.height,pz)
 
     def camera(self):
         x,z,desired=self.brain.camera_pose(self.distance) if self.auto else route(self.distance)
@@ -3819,11 +4301,19 @@ class Trench:
              z+math.cos(heading)*12)
         return eye,aim
 
+    def _rig_lab_position(self,spec):
+        if spec.enemy_id==-999:
+            ss=self.distance+5.1
+            x,z=sides(ss,0.0)
+            return (x,floor_y(ss,0.),z)
+        return self.enemy_position(spec)
+
     def draw(self):
         ww,hh=pygame.display.get_surface().get_size()
         self.ctx.viewport=(0,0,ww,hh)
         self.ctx.clear(.18,.23,.29,1.0,depth=1.0)
         eye,aim=self.camera()
+        self.last_player_eye=eye
         # Sun and sky have no translational parallax. Only orientation matters.
         forward=np.asarray(aim,dtype='f4')-np.asarray(eye,dtype='f4')
         forward/=max(1e-8,float(np.linalg.norm(forward)))
@@ -3853,20 +4343,46 @@ class Trench:
         if emitters:
             # ModernGL array members may be exposed via base name or [0].
             self.lamp_uniform.write(np.asarray(emitters+[(0.,0.,0.)]*(8-len(emitters)),dtype='f4').tobytes())
+        # Draw the SAME world and animated actor pose into the light depth maps.
+        # Bounded to current/adjacent chunks; F12 isolates GPU cost in F11.
+        if getattr(self,'pose_lab_index',-1)>=0:
+            dummy=self.pose_lab_dummy
+            dummy.route_m=self.distance+5.1
+            dummy.pose_preview=POSE_LAB[self.pose_lab_index]
+            visible=[dummy]
+            position_at=self._rig_lab_position
+        else:
+            visible=[a for a in self.enemies.active.values()
+                     if abs(a.route_m-self.distance)<65.]
+            position_at=self.enemy_position
+        instances=(self.enemy_renderer.collect_instances(visible,position_at,
+                         lambda ss:route(ss)[2]) if visible else [])
+        if self.shadow_renderer is not None:
+            shadow=self.shadow_renderer
+            if shadow.enabled:
+                try:
+                    shadow.draw_maps(self.chunks,self.enemy_renderer,instances,eye,emitters,
+                        (ww,hh),max(0,math.floor(self.distance/CHUNK_LEN)),self.elapsed)
+                except Exception as exc:
+                    # Restore old lighting instead of crashing on unsupported GL.
+                    print(f'Skuggor inaktiverade efter renderfel: {type(exc).__name__}: {exc}',file=sys.stderr)
+                    shadow.enabled=False
+            shadow.bind_material(self.prog)
+            shadow.bind_material(self.enemy_renderer.program)
         self.texture.use(location=0)
         self.normal_texture.use(location=1)
         for i in sorted(self.chunks):self.chunks[i][1].render()
         # All actors share GPU-resident geometry and materials; one set of
         # instance transforms per frame. World depth buffer occludes enemies.
-        visible=[a for a in self.enemies.active.values()
-                 if abs(a.route_m-self.distance)<65.]
         if visible:
-            self.enemy_renderer.draw(visible,self.enemy_position,
+            self.enemy_renderer.draw(visible,position_at,
                                      lambda ss:route(ss)[2],mat,eye,
                                      self.fog_strength,self.has_pbr_normals,
-                                     emitters)
+                                     emitters,instances=instances)
         # VFX on top of the real 3D depth-buffer (not baked into terrain).
         self.battlefield_renderer.draw(self.battlefield,mat,eye,right,up)
+        if not self.arcade.alive and self.pose_lab_index<0:
+            self.death_screen.draw(self.death_age,self.arcade,ww,hh)
         pygame.display.flip()
     def _record_profile(self,phase_ms):
         """Real CPU-phase latency report, not a GPU profiler or FPS guess."""
@@ -3917,13 +4433,19 @@ class Trench:
                     name=MOVES[self.mode][0]
                     notice=(' | '+self.hit_notification if time.monotonic()<self.hit_notification_until else '')
                     vfx_status='PÅ' if self.battlefield.enabled else 'AV'
-                    pygame.display.set_caption(f'3D SKYTTEGRAV V3.8.7 | {self.distance:06.0f} m | {self.brain.phase if self.auto else name} | {name} {self.speed:.1f} m/s | {self.fps:.0f} FPS | max {self.frame_max_ms:.0f}ms · upload {self.chunk_upload_ms:.0f}ms | F3 NÄRA F4 FLYG F5 ARTILLERI F6 GRANAT · F2 VFX {vfx_status} | ↑↓ 25m · MUSKLICK SKJUT · T SIKTE MITT · 0 AUTO{notice}')
+                    jump_note=''
+                    if self.debug_jump_target is not None:
+                        have,total=self._jump_ready_progress()
+                        jump_note=f' | LADDAR HOPP {self.debug_jump_target:.0f} m ({have}/{total} sektioner) – väntar säkert'
+                    pygame.display.set_caption(f'3D SKYTTEGRAV V3.9.5 | {self.arcade.status()} | {self.distance:06.0f} m | {self.brain.phase if self.auto else name} | {name} {self.speed:.1f} m/s | {self.fps:.0f} FPS | max {self.frame_max_ms:.0f}ms · upload {self.chunk_upload_ms:.0f}ms | F3 NÄRA F4 FLYG F5 ARTILLERI F6 GRANAT · F2 VFX {vfx_status} | ↑↓ 25m · MUSKLICK SKJUT · T SIKTE MITT · 0 AUTO{jump_note}{notice} | F1 SKELETT {POSE_LAB[self.pose_lab_index] if self.pose_lab_index>=0 else "AV"} | F12 SKUGGOR')
                 pygame.time.wait(1)
         finally:
             for vbo,vao,_ in self.chunks.values():vao.release();vbo.release()
             self.worker_stop.set();self.worker.join(timeout=1.0)
+            if self.shadow_renderer is not None:self.shadow_renderer.release()
             self.enemy_renderer.release()
             self.battlefield_renderer.release()
+            self.death_screen.release()
             self.normal_texture.release();self.texture.release();self.prog.release();self.sky_prog.release()
             pygame.quit()
 

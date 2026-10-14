@@ -191,6 +191,32 @@ class BattlefieldEventDirector:
                     self._queue_impact(self.elapsed + 2.4 + .20*k,
                                        tuple(float(v) for v in pos), .28, 'strafe')
 
+    def bullet_splash(self, position, *, material='earth'):
+        """Small, immediate near-miss chips; no terrain changes or player damage.
+
+        Returns a visual cue from a nearby surface, not a physically simulated
+        projectile ray. The gameplay rules still require actual enemy LOS.
+        """
+        if material not in ('earth','wood','stone'):
+            raise ValueError('unknown splash material')
+        x,y,z=(float(v) for v in position)
+        palette={'earth':(.36,.31,.25),'wood':(.33,.24,.15),
+                 'stone':(.41,.41,.39)}[material]
+        new=[]
+        for i in range(11):
+            angle=self.rng.uniform(0.,math.tau)
+            speed=self.rng.uniform(.5,2.3)
+            new.append(Particle(x,y,z,math.cos(angle)*speed,
+                                self.rng.uniform(.3,2.0),math.sin(angle)*speed,
+                                0.,self.rng.uniform(.35,.8),
+                                self.rng.uniform(.014,.052),0,palette,y-.7))
+        new.append(Particle(x,y+.1,z,0.,.27,0.,0.,.38,.24,2,
+                            tuple(v*.8 for v in palette),y-.7))
+        capacity=max(0,MAX_PARTICLES-len(new))
+        self.particles=self.particles[-capacity:] if capacity else []
+        self.particles.extend(new[:MAX_PARTICLES-len(self.particles)])
+        return len(new)
+
     def _queue_impact(self, at, pos, strength, origin):
         # Future pending effects are bounded, including during forced tests.
         if len(self.pending) >= MAX_PENDING:

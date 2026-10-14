@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+from combat_tactics import difficulty_at
 
 
 @dataclass(frozen=True)
@@ -129,6 +130,19 @@ class EnemyAgent:
         self.route_m=float(spec.route_m)
         self.investigation_goal=None
         self.heard_shots=0
+        # Tactical stage is visible in the real actor and the frozen hitboxes.
+        # No ghost peeking: lateral displacement modifies ONE shared world pose.
+        self.lateral_offset=0.0
+        self.peek_count=0
+        self.search_sweeps=0
+        self.tactical=False
+        self.tactical_difficulty=difficulty_at(spec.route_m)
+        # V3.9.2: animation follows ACTUAL route displacement, never a "running"
+        # state label that could animate the feet while blocked by the world.
+        self.gait_phase=0.0
+        self.gait_strength=0.0
+        self.gait_speed_mps=0.0
+        self.head_look=0.0
 
     def hear_shot(self,origin_route_m,max_range=78.0):
         """Enter route-following investigation if a NEW gunshot is ahead.
@@ -156,7 +170,90 @@ class EnemyAgent:
         if not self.dead and self.state in ('idle','investigating','alert'):
             self._transition('turning')
 
-    def update(self,dt):
+    def begin_tactical_encounter(self):
+        """A fair staged contact: scan, peek/retract, advance, locate, fire.
+
+        This is not line-of-sight authority. The director must still verify
+        actual sight before starting; the game separately requires the player
+        to see the actor before hostile shots may be lethal.
+        """
+        if self.dead or self.tactical or self.state not in ('idle','alert','investigating'):
+            return False
+        self.tactical=True
+        self._transition('scanning')
+        return True
+
+    def _tactical_pose(self, dt, player_route):
+        """Advance staged combat without teleporting or acquiring magic vision."""
+        cfg=self.tactical_difficulty
+        side=1 if self.spec.enemy_id%2 else -1
+        offset=0.0
+        crouch=0.0
+        phase=self.state
+        if phase=='scanning':
+            crouch=.35
+            if self.state_time>=cfg.scan_seconds:
+                self._transition('peeking')
+        elif phase=='peeking':
+            offset=side*.20
+            crouch=.30
+            if self.state_time>=.55:
+                self.peek_count+=1
+                self._transition('hiding')
+        elif phase=='hiding':
+            offset=-side*.16
+            crouch=1.0
+            if self.state_time>=.38:
+                self._transition('peeking' if self.peek_count<cfg.peek_cycles else 'rushing')
+                if self.state=='rushing':self.rush_from=self.route_m
+        elif phase in ('rushing','repositioning'):
+            offset=0.0
+            crouch=.14
+            goal=max(0.0, float(player_route) + 6.8) if player_route is not None else -1e8
+            speed=cfg.rush_speed*(.80 if phase=='repositioning' else 1.0)
+            self.route_m=max(goal,self.route_m-speed*dt)
+            distance_moved=getattr(self,'rush_from',self.route_m)-self.route_m
+            if distance_moved>= (2.8 if phase=='rushing' else 2.5) or self.route_m<=goal+1e-5:
+                self._transition('locating')
+        elif phase=='locating':
+            crouch=.2
+            if self.state_time>=cfg.locate_seconds:
+                self._transition('turning')
+        self.pose_crouch+=(crouch-self.pose_crouch)*(1.0-math.exp(-dt*4.4))
+        self.pose_aim+=(0.0-self.pose_aim)*(1.0-math.exp(-dt*5.5))
+        self.lateral_offset+=(offset-self.lateral_offset)*(1.0-math.exp(-dt*5.8))
+        return True
+
+    def update(self,dt,visible=True,player_route=None):
+        """Advance behavior, then animation from the *actual* travelled metres.
+
+        Separate from draw frequency and hit tests: the same deterministic
+        actor pose is consumed by rendering and shot-frozen hit spheres.
+        """
+        before=self.route_m
+        self._update_behavior(dt,visible,player_route)
+        dt=min(.1,max(0.0,float(dt)))
+        travelled=abs(self.route_m-before)
+        speed=travelled/max(dt,1.e-6)
+        # Smooth actual velocity independently of the 0..1 gait intensity.
+        # This allows walk/run animation differences without fake route motion.
+        gait_target=0.0 if self.dead else min(speed,5.0)
+        self.gait_speed_mps+=(gait_target-self.gait_speed_mps)*(1.-math.exp(-dt*7.))
+        target=min(1.0,speed/2.4) if not self.dead else 0.0
+        k=1.0-math.exp(-dt*(9.0 if target>self.gait_strength else 6.0))
+        self.gait_strength+=(target-self.gait_strength)*k
+        if travelled>.00001:
+            # Roughly one left+right step cycle per 1.25 m of travel.
+            self.gait_phase=(self.gait_phase+travelled*math.tau/1.25)%math.tau
+        if self.state in ('scanning','peeking','hiding','locating','searching','alert'):
+            target_look=.44*math.sin(self.total_time*(1.8+.15*self.tactical_difficulty.level)
+                                       +self.spec.enemy_id*.61)
+        else:
+            target_look=.06*math.sin(self.total_time*1.2+self.spec.enemy_id)
+        if self.dead:target_look=0.0
+        self.head_look+=(target_look-self.head_look)*(1.0-math.exp(-dt*5.8))
+
+    def _update_behavior(self,dt,visible=True,player_route=None):
         if dt<0:raise ValueError('negative timestep')
         dt=min(dt,.1)
         self.total_time+=dt
@@ -175,6 +272,21 @@ class EnemyAgent:
                 return
             self.blast_level=0
         self.state_time+=dt
+        if not visible and self.state in ('turning','aiming','firing','cover'):
+            self._transition('searching')
+        elif visible and self.state=='searching':
+            self._transition('locating' if self.tactical else 'turning')
+        if self.state=='searching':
+            self.pose_aim+=(0.0-self.pose_aim)*(1.-math.exp(-dt*5.0))
+            if self.tactical and self.state_time>=1.35:
+                self.search_sweeps+=1
+                self.rush_from=self.route_m
+                self._transition('repositioning')
+            return
+        if self.tactical and self.state in ('scanning','peeking','hiding',
+                                            'rushing','repositioning','locating'):
+            self._tactical_pose(dt,player_route)
+            return
         if self.state=='investigating':
             # Single-lane route-following patrol: no position snapping and no
             # movement before an actual heard shot. Runs at 2.55 m/s until the
@@ -199,6 +311,7 @@ class EnemyAgent:
             self._transition('cover' if self.profile.crouch_during_reload and self.shots_fired%3==0 else 'aiming')
         elif self.state=='cover' and self.state_time>=1.55:
             self._transition('aiming')
+        self.lateral_offset+=(0.0-self.lateral_offset)*(1.-math.exp(-dt*5.8))
         # Separate target stance from discrete AI. A continuous channel prevents
         # teleporting between crouch and upright or dropping the weapon each
         # time FIRING becomes AIMING. Rates are in inverse seconds.
@@ -238,27 +351,24 @@ class EnemyAgent:
         return self.pose_crouch
 
     def hit_regions(self,center,heading=0.0):
-        """Animated body proxies in actual WORLD SPACE, matching the model yaw.
+        """Frozen proxy centres sampled from the SAME animated joint pose.
 
-        Placeholder shapes are deliberately approximate until skeletal GLB
-        bone hitboxes exist. They never enlarge on a miss for aim assist.
+        No artificially enlarged aim assist. This remains sphere-based collision;
+        it is not a replacement for future triangle/skinned rig picking.
         """
         if self.dead:return ()
+        joints=actor_joints(self)
         x,y,z=center
-        crouch=self.crouch_fraction()
-        drop=.27*crouch
-        breathing=(.021*math.sin(self.total_time*13.2) if self.state=='investigating'
-                   else .009*math.sin(self.total_time*2.1))
         c,si=math.cos(heading),math.sin(heading)
-        def pt(dx,dy,dz):
+        def pt(local):
+            dx,dy,dz=local
             return (x+c*dx+si*dz,y+dy,z-si*dx+c*dz)
-        stride=.16*math.sin(self.total_time*11.) if self.state=='investigating' else 0.
         return (
-            ('head',pt(0.,1.67-drop+breathing,.025),.195),
-            ('torso',pt(0.,1.17-drop+breathing,0.),.315),
-            ('pelvis',pt(0.,.89-drop*.57,0.),.23),
-            ('left_leg',pt(-.16,.53-.10*crouch,.055+stride),.145),
-            ('right_leg',pt(.16,.53-.10*crouch,.055-stride),.145),
+            ('head',pt(joints['head']),.179),
+            ('torso',pt(joints['torso']),.307),
+            ('pelvis',pt(joints['pelvis']),.221),
+            ('left_leg',pt(joints['knees'][0]),.150),
+            ('right_leg',pt(joints['knees'][1]),.150),
         )
 
 
@@ -289,12 +399,14 @@ class EnemyDirector:
         self.eliminated=set()
         self.contact_count=0
         self.last_hit=None
+        self.gunshots_this_frame=()
 
     def reset(self):
         self.active.clear()
         self.eliminated.clear()
         self.contact_count=0
         self.last_hit=None
+        self.gunshots_this_frame=()
 
     def hear_shot(self,route_m,max_range=78.0):
         """Gunfire is a local cue. Returns IDs of newly alerted patrols.
@@ -308,7 +420,7 @@ class EnemyDirector:
                 alerted.append(idx)
         return tuple(alerted)
 
-    def update(self,dt,route_m):
+    def update(self,dt,route_m,can_see_player=None):
         # First four remain fixed; later patrols are a denser but bounded 72m
         # grid. Never allocate enemies across the infinite level in advance.
         first=max(4,4+int(math.floor((route_m-105.-516.)/72.)))
@@ -319,6 +431,8 @@ class EnemyDirector:
             if abs(spec.route_m-route_m)<=90.0:
                 self.active.setdefault(idx,EnemyAgent(spec))
         gunshots=[]
+        shot_ids=[]
+        self.gunshots_this_frame=()
         for idx,agent in list(self.active.items()):
             if agent.dead:
                 self.eliminated.add(idx)
@@ -327,18 +441,23 @@ class EnemyDirector:
                 continue
             # Visible/nearby patrol reaches combat distance and stops moving
             # even when it was previously following a distant sound.
-            if not agent.dead and 0.0<agent.route_m-route_m<=16.0:
-                if agent.state in ('idle','investigating','alert'):
-                    agent.engage()
+            close=not agent.dead and 0.0<agent.route_m-route_m<=16.0
+            visible=(can_see_player(agent) if can_see_player is not None and close else
+                     can_see_player(agent) if can_see_player is not None and
+                     agent.state in ('turning','aiming','firing','cover','searching') else True)
+            if close and visible and agent.state in ('idle','investigating','alert'):
+                if agent.begin_tactical_encounter():
                     self.contact_count+=1
             before=agent.shots_fired
-            agent.update(dt)
+            agent.update(dt,visible=visible,player_route=route_m)
             if agent.shots_fired>before and not agent.dead:
                 gunshots.append(agent.route_m)
+                shot_ids.append(idx)
         # Fired enemy rifles can alert other patrols, but only AFTER this
         # frame's states were updated, preventing order-dependent cascades.
         for source_m in gunshots:
             self.hear_shot(source_m,max_range=82.0)
+        self.gunshots_this_frame=tuple(shot_ids)
 
     def react_to_blast(self,impact_position,strength,level_for_distance,position_at):
         """Apply one blast signal to ACTUALLY nearby active enemies.
@@ -456,7 +575,7 @@ def _rotated_support_bottom(part, angle):
     """
     if part[1] not in (10, 23, 24, 25):
         return None
-    if part[0] == 'cylinder':
+    if part[0] in ('cylinder','limb'):
         return min(part[2][1], part[3][1]) - part[4]
     cx,cy,cz=part[2]
     if part[0] == 'jacket':
@@ -464,6 +583,8 @@ def _rotated_support_bottom(part, angle):
         ry,rz=.40*part[3][1],.22*part[3][2]
     elif part[0] == 'helmet':
         ry,rz=.20*part[3][1],.245*part[3][2]
+    elif part[0] == 'face':
+        ry,rz=.19*part[3][1],.18*part[3][2]
     else:
         _,ry,rz=part[3]
     return cy - abs(math.cos(angle))*ry - abs(math.sin(angle))*rz
@@ -479,172 +600,200 @@ def corpse_ground_clearance(parts, angle):
     return max(0.0, .012 - min(lows)) if lows else 0.0
 
 
-def enemy_parts(agent):
-    """Compact render-neutral, animated humanoid rig with shared GPU meshes.
+def actor_joints(agent):
+    """One lightweight, deterministic local-space joint pose for mesh AND hitboxes.
 
-    Parts are (shape, material, centre, scale) for ellipsoid/box/jacket/helmet,
-    or (cylinder, material, point_a, point_b, radius). During falling the
-    non-cylindrical parts gain a fifth ``pitch`` value so geometry AND position
-    rotate together. All metre coordinates are relative to the foot-level
-    ground anchor shared with the first-person world.
-
-    These models remain procedural stand-ins for proper rigged GLB characters.
+    A measured travelled distance animates feet, not simply being in the rush
+    state. Crouch bends knees rather than shrinking all limbs uniformly.
+    Joint coordinates are in metres relative to a stationary ground anchor.
     """
-    crouch=agent.crouch_fraction()
+    crouch=max(0.,min(1.,agent.crouch_fraction()))
+    move=max(0.,min(1.,getattr(agent,'gait_strength',0.0)))
+    cycle=getattr(agent,'gait_phase',0.0)
+    bob=.022*move*(1.0-math.cos(cycle*2.0))
+    lean=.045*move+.055*crouch
+    pelvis=(0.,.88-.18*crouch+bob,.015+.025*move)
+    torso=(0.,1.15-.26*crouch+bob,.045+lean)
+    head=(0.,1.67-.28*crouch+bob,.045+lean*.7)
+    hips=[]; knees=[];ankles=[];feet=[]
+    for i,side in enumerate((-1.,1.)):
+        wave=math.sin(cycle+math.pi*i)
+        stride=.205*move*wave
+        rise=.105*move*max(0.,wave)
+        foot_z=.075+stride+.11*crouch
+        # A bent knee travels forward under cover, with smooth ankle extension.
+        hip=(side*.16,pelvis[1]-.015,pelvis[2])
+        knee=(side*.17,.49-.125*crouch+bob*.35+rise*.34,
+              .085+.055*wave*move+.18*crouch)
+        ankle=(side*.175,.165+rise,foot_z-.065)
+        boot=(side*.175,.108+rise,foot_z+.045)
+        hips.append(hip);knees.append(knee);ankles.append(ankle);feet.append(boot)
+    return {'pelvis':pelvis,'torso':torso,'head':head,
+            'hips':tuple(hips),'knees':tuple(knees),
+            'ankles':tuple(ankles),'feet':tuple(feet),
+            'move':move,'cycle':cycle,'crouch':crouch}
+
+
+def enemy_parts(agent):
+    """V3.9.2 articulated procedural stand-in for a future rigged GLB soldier.
+
+    This returns shared-mesh rigid components, never dynamic mesh allocations.
+    Every weapon, uniform, helmet, knee, boot and head movement belongs to the
+    SAME sampled pose as shot-frozen head/torso/leg hit regions.
+    """
+    pose=actor_joints(agent)
+    crouch=pose['crouch']
     aim=agent.aim_fraction()
-    dying=_smoothstep01(agent.state_time/1.10) if agent.dead else 0.0
-    breath=(.021*math.sin(agent.total_time*13.2) if agent.state=='investigating'
-            else .009*math.sin(agent.total_time*2.1) if not agent.dead else 0.0)
-    drop=crouch*.25
-    torso_y=1.15-drop+breath
-    head_y=1.67-drop+breath
-    recoil=0.0
-    if agent.state == 'firing':
-        recoil=.065*math.exp(-agent.state_time*17.0)
+    move=pose['move'];cycle=pose['cycle']
+    dying=_smoothstep01(agent.state_time/1.18) if agent.dead else 0.0
+    torso=pose['torso'];head=pose['head'];pelvis=pose['pelvis']
+    torso_y=torso[1];head_y=head[1];torso_z=torso[2]
+    recoil=(.056*math.exp(-agent.state_time*18.) if agent.state=='firing' else 0.)
     parts=[]
-    def oval(mat,center,radii):parts.append(('oval',mat,center,radii))
-    def cube(mat,center,radii):parts.append(('cube',mat,center,radii))
-    def cyl(mat,a,b,r):parts.append(('cylinder',mat,a,b,r))
+    def oval(mat,center,radii,angles=None):
+        parts.append(('oval',mat,center,radii) if angles is None
+                     else ('oval',mat,center,radii,angles))
+    def cube(mat,center,radii,angles=None):
+        parts.append(('cube',mat,center,radii) if angles is None
+                     else ('cube',mat,center,radii,angles))
+    def cyl(mat,a,b,r,shape='cylinder'):
+        parts.append((shape,mat,a,b,r))
     def jacket(mat,center):parts.append(('jacket',mat,center,(1.,1.,1.)))
-    def helmet(mat,center):parts.append(('helmet',mat,center,(1.,1.,1.)))
+    def helmet(mat,center,angles=None):
+        parts.append(('helmet',mat,center,(1.,1.,1.)) if angles is None
+                     else ('helmet',mat,center,(1.,1.,1.),angles))
 
-    # Alternating strides while a heard-shot patrol runs toward the player.
-    for side in (-1.,1.):
-        x=side*.155
-        stride=(.16*math.sin(agent.total_time*11.)*side if agent.state=='investigating'
-                else 0.)
-        foot_lift=(.09*max(0.,math.sin(agent.total_time*11.)*side)
-                   if agent.state=='investigating' else 0.)
-        cyl(23,(x,.87-drop,0.),(x*1.14,.49-.10*crouch,.025+stride),.128)
-        oval(23,(x*1.14,.49-.10*crouch,.025+stride),(.137,.145,.132))
-        cyl(23,(x*1.14,.46-.10*crouch,.025+stride),
-               (x*1.16,.16+foot_lift,.043+.13*crouch+stride),.102)
-        cube(10,(x*1.16,.107+foot_lift,.103+.13*crouch+stride),(.135,.109,.229))
-        cube(24,(x*1.16,.22+foot_lift,.048+.13*crouch+stride),(.111,.116,.133))
-    # Hips and structured jacket remove the round-rock/teddybear silhouette.
-    oval(23,(0.,.88-drop*.72,0.),(.255,.18,.164))
-    jacket(23,(0.,torso_y,0.))
-    # Padded chest armour on the front, plates and straps.
-    cube(24,(0.,torso_y+.005,.215),(.247,.245,.064))
-    cube(24,(0.,torso_y-.215,.214),(.261,.041,.079))
-    for side in (-1.,1.):
-        x=side*.157
-        cube(24,(x,torso_y-.18,.294),(.089,.119,.057))  # magazine pouch
-        cyl(24,(side*.23,torso_y+.29,.195),
-               (side*.12,torso_y-.29,.264),.020)      # harness strap
-    cube(10,(0.,torso_y-.315,.175),(.255,.026,.037)) # belt buckle line
+    # Actual stride-driven joints. Knees bend and feet lift instead of rigid legs
+    # swinging through the floor. Trousers use sculpted cloth-tapered limbs.
+    for i,side in enumerate((-1.,1.)):
+        hip=pose['hips'][i];knee=pose['knees'][i];ankle=pose['ankles'][i];foot=pose['feet'][i]
+        cyl(23,hip,knee,.141,'limb')
+        oval(23,knee,(.139,.123,.138))
+        cyl(23,knee,ankle,.110,'limb')
+        # Visible knee pad and ankle gaiter follow the ACTUAL knee and ankle.
+        oval(24,(knee[0],knee[1]-.010,knee[2]+.100),(.096,.095,.050))
+        oval(24,(ankle[0],ankle[1]+.016,ankle[2]+.002),(.112,.118,.115))
+        parts.append(('boot',10,foot,(.136,.108,.229)))
+        # A separate toe-cap layer is intentionally avoided: it reads as a toy.
 
-    # Backpack follows the spine; compact enough not to prop the corpse upright.
-    cube(24,(0.,torso_y-.09,-.236),(.246,.295,.132))
-    cube(24,(0.,torso_y+.195,-.232),(.19,.075,.115))
+    oval(23,pelvis,(.247,.176,.169))
+    jacket(23,(torso[0],torso_y,torso_z))
+    # Cloth tunic, protective webbing and asymmetric pouches.
+    cube(24,(0.,torso_y+.015,torso_z+.215),(.244,.232,.051))
+    cube(24,(0.,torso_y-.22,torso_z+.198),(.255,.040,.065))
     for side in (-1.,1.):
-        cube(24,(side*.223,torso_y-.13,-.233),(.057,.176,.112))
-        cyl(24,(side*.20,torso_y+.26,-.14),
-               (side*.175,torso_y-.19,-.25),.023)
+        x=side*.16
+        cube(24,(x,torso_y-.195,torso_z+.282),(.080,.112,.058))
+        cyl(24,(side*.226,torso_y+.28,torso_z+.172),
+               (side*.125,torso_y-.265,torso_z+.242),.016)
+    cube(10,(0.,torso_y-.32,torso_z+.14),(.247,.024,.025))
+    # Backpack follows upper body. Smaller silhouette than old oversized cube.
+    cube(24,(0.,torso_y-.10,torso_z-.224),(.226,.275,.120))
+    cube(24,(0.,torso_y+.156,torso_z-.216),(.185,.052,.110))
+    for side in (-1.,1.):
+        cube(24,(side*.206,torso_y-.13,torso_z-.225),(.047,.155,.102))
+        cyl(24,(side*.20,torso_y+.255,torso_z-.14),
+               (side*.171,torso_y-.20,torso_z-.238),.018)
 
-    # Field kit: small but recognisable asymmetric equipment per encounter.
-    # Reuses EXISTING shape/material GPU buffers (no runtime mesh creation).
-    kit=agent.spec.enemy_id % 3
-    if kit == 0:
-        # Canteen clipped to right hip, with short neck/cap.
-        oval(24,(.286,.784-drop*.65,-.085),(.096,.131,.083))
-        cyl(24,(.286,.90-drop*.65,-.085),(.286,.94-drop*.65,-.085),.032)
-    elif kit == 1:
-        # Folded bedroll secured on top of the pack; not a large floating lump.
-        cyl(13,(-.18,torso_y+.268,-.258),(.18,torso_y+.268,-.258),.071)
-        for x in (-.12,.12):
-            cube(24,(x,torso_y+.269,-.25),(.018,.082,.091))
+    kit=agent.spec.enemy_id%3
+    if kit==0:
+        oval(24,(.285,.79-.17*crouch,-.07),(.080,.118,.072))
+        cyl(24,(.285,.88-.17*crouch,-.07),(.285,.91-.17*crouch,-.07),.024)
+    elif kit==1:
+        cyl(13,(-.17,torso_y+.25,torso_z-.252),(.17,torso_y+.25,torso_z-.252),.063)
+        for x in (-.11,.11):cube(24,(x,torso_y+.252,torso_z-.25),(.016,.077,.081))
     else:
-        # Side radio/satchel with lid and retaining strap.
-        cube(24,(-.32,torso_y-.20,-.10),(.100,.182,.122))
-        cube(10,(-.322,torso_y-.043,-.10),(.097,.023,.125))
-        cyl(24,(-.32,torso_y-.03,-.10),(-.32,torso_y+.29,-.16),.014)
+        cube(24,(-.30,torso_y-.23,torso_z-.12),(.086,.158,.105))
+        cube(10,(-.30,torso_y-.082,torso_z-.12),(.084,.019,.106))
+        cyl(24,(-.30,torso_y-.10,torso_z-.12),(-.30,torso_y+.20,torso_z-.17),.013)
 
-    # Shoulders: upper arms and lower arms are continuous, with hands on gun.
-    for side in (-1.,1.):
-        shoulder=(side*.307,torso_y+.225,-.008)
-        elbow=(side*.337,torso_y-.055,.045 if agent.dead else .09+aim*.090)
-        hand=((side*.335,torso_y-.225,.065) if agent.dead else
-              (side*.115,torso_y-.135+aim*.285,.345+aim*.25-recoil))
-        oval(23,shoulder,(.139,.133,.151))
-        cyl(23,shoulder,elbow,.113)
-        oval(23,elbow,(.112,.109,.110))
-        cyl(23,elbow,hand,.090)
-        oval(24,hand,(.095,.079,.080))
-
-    # Human face and a flatter combat helmet (not an oversized camo sphere).
-    cyl(25,(0.,torso_y+.310,.012),(0.,head_y-.122,.030),.090)
-    oval(25,(0.,head_y,.025),(.145,.189,.147))
-    oval(25,(0.,head_y-.025,.152),(.115,.120,.066))
-    for side in (-1.,1.):
-        oval(25,(side*.147,head_y-.025,.035),(.035,.062,.045))
-        # Dark eyes, softened by the helmet shadow at 8m distance.
-        oval(10,(side*.055,head_y+.024,.207),(.019,.014,.014))
-    oval(25,(0.,head_y-.027,.217),(.031,.041,.042))  # nose bridge
-    cyl(10,(-.043,head_y-.102,.201),(.043,head_y-.102,.201),.007)
-    helmet(24,(0.,head_y+.160,.015))
-    # Ear/helmet straps sit OUTSIDE the cheek rather than crossing the face.
-    cyl(24,(-.158,head_y+.029,.02),(-.125,head_y-.128,.142),.016)
-    cyl(24,( .158,head_y+.029,.02),( .125,head_y-.128,.142),.016)
-
-    # Rifle. Separate barrel, stock, receiver, sights and curved magazine.
-    weapon_begin=len(parts)
+    # Hands are connected to a rifle held at a meaningful height. A small
+    # inverse-phase gait sway settles as soon as physical travel stops.
     gy=torso_y-.17+aim*.32
-    gz=.295+aim*.16-recoil
-    cyl(10,(-.045,gy+.010,gz-.13),(.005,gy+.035,gz+.49),.046)
-    cyl(10,(.005,gy+.035,gz+.44),(.005,gy+.035,gz+.98),.019)
-    cyl(13,(-.055,gy,gz-.10),(-.124,gy-.10,gz-.41),.048)
-    cyl(13,(.004,gy-.008,gz+.28),(.004,gy-.008,gz+.58),.040)
-    cube(10,(-.026,gy+.035,gz+.13),(.055,.077,.161))
-    cyl(10,(-.024,gy-.035,gz+.12),(-.012,gy-.20,gz+.18),.036)
-    cyl(10,(-.012,gy-.20,gz+.18),(.000,gy-.25,gz+.28),.034)
-    cyl(10,(.004,gy+.080,gz+.75),(.004,gy+.11,gz+.75),.013)
-    if agent.state=='firing' and agent.state_time<.125:
-        oval(11,(.004,gy+.035,gz+1.03),(.07,.073,.14))
+    gz=torso_z+.26+aim*.16-recoil
+    for i,side in enumerate((-1.,1.)):
+        wave=math.sin(cycle+math.pi*i)
+        shoulder=(side*.304,torso_y+.22,torso_z-.010)
+        elbow=(side*.337,torso_y-.055+aim*.045,
+               torso_z+.06+aim*.080+.024*move*wave)
+        hand=(side*.115,gy+.035+(.012*move*wave),gz+.045)
+        oval(23,shoulder,(.135,.128,.139))
+        cyl(23,shoulder,elbow,.103,'limb')
+        oval(23,elbow,(.103,.10,.106))
+        cyl(23,elbow,hand,.081,'limb')
+        oval(24,hand,(.083,.069,.076))
 
-    # True rigid pose rotation around the lower-body pivot. Unlike V3.3,
-    # backpacks, helmets, VESTS, BOOTS and jacket actually ROTATE too.
+    # Anatomical face, rather than a full round face and separate "teddy" muzzle.
+    # Look yaw is independent of entire body yaw; attached eyes/straps/helmet
+    # rotate around the cervical joint without teleporting a visible head.
+    look=getattr(agent,'head_look',0.0)
+    co,si=math.cos(look),math.sin(look)
+    def hp(dx,dy,dz):
+        return (dx*co+dz*si,head_y+dy,head[2]-dx*si+dz*co)
+    head_rot=(0.,look,0.)
+    cyl(25,(0.,torso_y+.305,torso_z+.02),hp(0.,-.145,-.01),.077)
+    parts.append(('face',25,hp(0.,0.,.025),(1.,1.,1.),head_rot))
+    for side in (-1.,1.):
+        oval(25,hp(side*.135,-.035,.023),(.026,.050,.033),head_rot)
+        oval(10,hp(side*.055,.028,.166),(.016,.013,.012),head_rot)
+    # Nose bridge and subtle lip separation are attached to turning face.
+    oval(25,hp(0.,-.038,.164),(.028,.042,.033),head_rot)
+    cyl(10,hp(-.035,-.109,.169),hp(.035,-.109,.169),.0045)
+    helmet(24,hp(0.,.160,.015),head_rot)
+    for side in (-1.,1.):
+        cyl(24,hp(side*.157,.027,.015),hp(side*.123,-.128,.122),.012)
+
+    # Rifle: fixed local part identities let us animate the recoil and drop
+    # without updating GL vertex buffers for each shot.
+    weapon_begin=len(parts)
+    cyl(10,(-.045,gy+.010,gz-.11),(.005,gy+.035,gz+.48),.041)
+    cyl(10,(.005,gy+.035,gz+.41),(.005,gy+.035,gz+.96),.016)
+    cyl(13,(-.055,gy,gz-.09),(-.124,gy-.10,gz-.36),.042)
+    cyl(13,(.004,gy-.008,gz+.28),(.004,gy-.008,gz+.55),.034)
+    cube(10,(-.026,gy+.035,gz+.12),(.053,.071,.144))
+    cyl(10,(-.022,gy-.032,gz+.10),(-.008,gy-.19,gz+.17),.033)
+    cyl(10,(-.008,gy-.19,gz+.17),(.006,gy-.24,gz+.27),.029)
+    cyl(10,(.004,gy+.077,gz+.73),(.004,gy+.104,gz+.73),.012)
+    if agent.state=='firing' and agent.state_time<.115:
+        oval(11,(.004,gy+.035,gz+1.0),(.064,.066,.129))
+
     if dying:
-        angle=1.52*dying  # tips FORWARD, leaving the backpack facing up
-        pivot_y=.13
-        pivot_z=.10
-        co=math.cos(angle); si=math.sin(angle)
+        # First fold knees, then lean and settle forward; the old immediate
+        # plank rotation was visually rigid. Keep all body parts grounded.
+        buckle=.14*_smoothstep01(agent.state_time/.34)
+        angle=1.52*dying
+        pivot_y=.13;pivot_z=.10
+        co,si=math.cos(angle),math.sin(angle)
         def rotate(point):
             x,y,z=point
+            y=max(.09,y-buckle*max(0.0,min(1.0,(y-.2)*1.5)))
             y-=pivot_y;z-=pivot_z
-            return (x, pivot_y+y*co-z*si, pivot_z+y*si+z*co)
+            return (x,pivot_y+y*co-z*si,pivot_z+y*si+z*co)
         rotated=[]
         for part in parts[:weapon_begin]:
-            if part[0]=='cylinder':
+            if part[0] in ('cylinder','limb'):
                 rotated.append((part[0],part[1],rotate(part[2]),rotate(part[3]),part[4]))
             else:
                 rotated.append((part[0],part[1],rotate(part[2]),part[3],angle))
-        # Only the BODY must support itself against the ground, not a rifle
-        # muzzle that otherwise pokes vertically through the terrain.
         lift=corpse_ground_clearance(rotated,angle)
         corrected=[]
         def up(point):return (point[0],point[1]+lift,point[2])
         for part in rotated:
-            if part[0]=='cylinder':
+            if part[0] in ('cylinder','limb'):
                 corrected.append((part[0],part[1],up(part[2]),up(part[3]),part[4]))
             else:
                 corrected.append((part[0],part[1],up(part[2]),part[3],angle))
-        # Drop the rifle to the actor's right. A real animated rig will later
-        # provide hand release and angular inertia; this remains deterministic.
-        release=_smoothstep01((agent.state_time-.20)/.60)
+        release=_smoothstep01((agent.state_time-.19)/.58)
         def dropped(point):
-            return (point[0]+.42, .15+(point[1]-gy)*.20,
-                    1.16+(point[2]-gz))
+            return (point[0]+.38,.14+(point[1]-gy)*.18,1.08+(point[2]-gz))
         def weapon_point(point):
             left=up(rotate(point));right=dropped(point)
             return tuple(left[i]*(1.-release)+right[i]*release for i in range(3))
         for part in parts[weapon_begin:]:
-            if part[0]=='cylinder':
+            if part[0] in ('cylinder','limb'):
                 corrected.append((part[0],part[1],weapon_point(part[2]),
                                   weapon_point(part[3]),part[4]))
             else:
-                # Rifle components should come to rest flat, not remain pitched.
-                # Spheres are symmetrical enough for a smooth tip transition.
                 corrected.append((part[0],part[1],weapon_point(part[2]),
                                   part[3],angle*(1.-release)))
         return corrected
@@ -654,6 +803,17 @@ def enemy_parts(agent):
 def actor_facing(agent,heading):
     """Facing world yaw; patrol running DOWN the route faces sound source."""
     if agent.state=='investigating':return heading+math.pi
+    if agent.state in ('idle','alert') and agent.spec.profile=='unaware':
+        # A sentry gradually sweeps the trench. It must LOOK toward the player
+        # before visual contact; never instant omniscience or idle blindness.
+        if agent.heard_shots:
+            return heading+math.pi*.94
+        fraction=.70+.67*math.sin(agent.total_time*.67+agent.spec.enemy_id*.43)
+        return heading+math.pi*fraction
+    if agent.state in ('scanning','peeking','hiding','locating'):
+        sweep=.79*math.sin(agent.total_time*(1.65+agent.tactical_difficulty.level*.18)
+                            +agent.spec.enemy_id*.47)
+        return heading+math.pi+sweep
     if agent.spec.profile=='unaware':return heading+math.pi*agent.turn_fraction()
     if agent.spec.profile=='ambush':
         # No sudden 58-degree snap on engage: the lookout had already turned
