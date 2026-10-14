@@ -81,6 +81,38 @@ def line_clear(origin, target, route_start, route_end, *, route, sides,
     return True
 
 
+def mesh_clear_body(origin,body,meshes):
+    """Sight samples against PRESENTED solid triangles for off-trunk sentries.
+
+    Unlike the old route cylinder, this respects excavated doorways. Never
+    claim sight when the current world mesh has not been loaded yet.
+    """
+    if not meshes:return ()
+    from shot_geometry import trace_world
+    visible=[]
+    for x,y,z,radius in body:
+        dx,dy,dz=x-origin[0],y-origin[1],z-origin[2]
+        length=math.sqrt(dx*dx+dy*dy+dz*dz)
+        if length<.09 or length>55.:continue
+        direction=(dx/length,dy/length,dz/length)
+        if trace_world(origin,direction,length,meshes) is None:
+            visible.append((x,y,z,radius))
+    return tuple(visible)
+
+
+def enemy_shown_to_player_mesh(frame,enemy_id,eye):
+    """Last-presented frame: projection AND shared world mesh both agree."""
+    if frame is None or not frame.world_shot_meshes:return False
+    from combat_tactics import projected_visible
+    for ident,part,center,radius in frame.hit_spheres:
+        if ident!=enemy_id:continue
+        if not projected_visible(center,frame.view_projection,frame.width,frame.height):
+            continue
+        if mesh_clear_body(eye,((*center,radius),),frame.world_shot_meshes):
+            return True
+    return False
+
+
 def can_see_body(origin,body,route_start,route_end,**geometry):
     visible=[]
     for x,y,z,radius in body:

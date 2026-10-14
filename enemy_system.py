@@ -35,6 +35,11 @@ class EnemySpec:
     route_m: float
     lateral: float
     profile: str
+    branch_index: int | None = None
+    branch_side: int = 0
+    branch_depth: float = 0.0
+    exterior_side: int = 0
+    exterior_clearance: float = 1.15
 
 
 def encounter_spec(index):
@@ -60,6 +65,73 @@ def encounter_spec(index):
         lateral = encounter_lateral(index)
         kind = ('ambush','cover','unaware')[index % 3]
     return EnemySpec(index, s, lateral, kind)
+
+
+# Later encounters occasionally have a second real soldier, not a second
+# hitbox on the same actor. High IDs cannot overlap infinite primary IDs in
+# any realistically addressable route window; no infinite pair registry.
+PAIR_ID_BASE = 1000000000
+PAIR_FIRST = 4
+PAIR_PERIOD = 5
+
+
+def encounter_partner_spec(primary_index):
+    """Seed-stable companion beside selected post-tutorial encounters.
+
+    Never alter the four physically tested early encounters. A companion is
+    its own independently simulated, shot-frozen enemy with a distinct ID.
+    """
+    if primary_index < PAIR_FIRST or (primary_index-PAIR_FIRST) % PAIR_PERIOD:
+        return None
+    lead=encounter_spec(primary_index)
+    flank=-1 if lead.lateral>=0 else 1
+    return EnemySpec(PAIR_ID_BASE+primary_index,lead.route_m+2.45,
+                     flank*.57,'cover' if primary_index%2 else 'ambush')
+
+
+BRANCH_ENEMY_ID_BASE = 2000000000
+
+
+def side_room_enemy_spec(index,side):
+    """A REAL side-room sentry in a sparse subset of existing dugouts.
+
+    Route metre identifies its junction for streaming, not a fake world
+    position. Rendering, frozen hit spheres and sight resolve branch geometry.
+    """
+    if index<7 or index%8!=7:
+        return None
+    return EnemySpec(BRANCH_ENEMY_ID_BASE+index,64.0+72.0*index,0.0,
+                     'ambush',branch_index=index,
+                     branch_side=1 if side>=0 else -1,
+                     branch_depth=2.8)
+
+
+EXTERIOR_PATROL_ID_BASE = 3000000000
+
+
+def exterior_patrol_spec(index):
+    """Sparse REAL above-bank patrols away from openings and tutorial combat.
+
+    One lookout near the midpoint between 72m-spaced junctions every eight
+    main encounters; side is deterministic, not a screen-space placement.
+    """
+    if index < 7 or index % 8 != 7:
+        return None
+    route_m = encounter_spec(index).route_m
+    side = 1 if (index // 8) % 2 else -1
+    return EnemySpec(EXTERIOR_PATROL_ID_BASE + index,route_m,0.,'unaware',
+                     exterior_side=side,exterior_clearance=1.30)
+
+
+def off_trunk(spec):
+    """Real exterior and side-room enemies require *triangle* LOS authority."""
+    return spec.branch_index is not None or spec.exterior_side != 0
+
+
+def primary_for_partner(enemy_id):
+    index=int(enemy_id)-PAIR_ID_BASE
+    return (index if index>=PAIR_FIRST and
+            (index-PAIR_FIRST)%PAIR_PERIOD==0 else None)
 
 
 def _vec_sub(a,b):
@@ -145,6 +217,14 @@ class EnemyAgent:
         self.gait_strength=0.0
         self.gait_speed_mps=0.0
         self.head_look=0.0
+        # World-space cover target; actual visible position AND frozen hit
+        # spheres always use route_m + lateral_offset from this same agent.
+        self.cover_goal=None          # (route_m, lateral, object_id)
+        self.cover_obstacle_id=None
+        self.cover_reactions=0
+        self.ally_lost=False
+        self.last_cover_reaction_time=-1000.0
+        self.patrol_origin=float(spec.route_m)
 
     def hear_shot(self,origin_route_m,max_range=78.0):
         """Enter route-following investigation if a NEW gunshot is ahead.
@@ -152,7 +232,7 @@ class EnemyAgent:
         This early main-route-only perception uses path distance, not magical
         X-ray awareness of off-route dugouts. Do not chase from behind player.
         """
-        if self.dead or self.state!='idle':return False
+        if self.dead or self.state!='idle' or off_trunk(self.spec):return False
         ahead=self.route_m-float(origin_route_m)
         if not (1.5<ahead<=max_range):return False
         self.investigation_goal=max(float(origin_route_m)+10.,self.route_m-42.)
@@ -166,6 +246,80 @@ class EnemyAgent:
         if level<=0 or self.dead:return False
         self.blast_level=max(self.blast_level,level)
         self.blast_timer=max(self.blast_timer,{1:.40,2:1.05,3:1.65}[self.blast_level])
+        return True
+
+    def react_to_fire(self, cover=None, *, ally_lost=False):
+        """React to audible nearby player fire without acquiring player LOS.
+
+        A REAL static box or sandbag site may be supplied by the director.
+        Otherwise this is suppression, not an invented invulnerable cover.
+        """
+        if self.dead or self.state in ('idle','investigating'):
+            return False
+        # Do not restart a cover maneuver at 60 Hz or on every rapid shot.
+        if (self.state in ('seeking_cover','sheltered','suppressed') or
+            self.total_time-self.last_cover_reaction_time<2.2):
+            return False
+        self.last_cover_reaction_time=self.total_time
+        if ally_lost:
+            self.ally_lost=True
+        self.cover_reactions+=1
+        if cover is not None:
+            # An obstacle must be between the player and this actor; the
+            # director is responsible for that physical world-space check.
+            s=float(cover.s)
+            lateral=float(cover.lateral)
+            self.cover_goal=(s+max(.61,cover.length*.5+.28),lateral,cover.index)
+            self.cover_obstacle_id=cover.index
+            self._transition('seeking_cover')
+        else:
+            self.cover_goal=None
+            self.cover_obstacle_id=None
+            self._transition('suppressed')
+        return True
+
+    def _cover_movement(self,dt):
+        """Finite, continuous displacement; never jump rendered or hit pose."""
+        state=self.state
+        if state=='suppressed':
+            goal_crouch=1.0
+            goal_aim=.05
+            if self.state_time>=1.00:
+                self._transition('locating' if self.tactical else 'turning')
+        elif state=='seeking_cover':
+            if self.cover_goal is None:
+                self._transition('suppressed')
+                return True
+            target_route,target_lane,_=self.cover_goal
+            ds=target_route-self.route_m
+            self.route_m+=math.copysign(min(abs(ds),2.1*dt),ds) if abs(ds)>1e-6 else 0.
+            lateral_target=target_lane-self.spec.lateral
+            diff=lateral_target-self.lateral_offset
+            self.lateral_offset+=math.copysign(min(abs(diff),1.15*dt),diff) if abs(diff)>1e-6 else 0.
+            goal_crouch=.52
+            goal_aim=.03
+            if abs(ds)<.11 and abs(diff)<.10:
+                self._transition('sheltered')
+        elif state=='sheltered':
+            goal_crouch=1.0
+            goal_aim=.04
+            if self.state_time>=1.35:
+                self._transition('cover_peek')
+        elif state=='cover_peek':
+            # Deliberately expose a real shoulder out from the side of the
+            # static prop, not a magic 'fire through cover' exemption.
+            lane=(self.cover_goal[1] if self.cover_goal else self.spec.lateral)
+            desired=lane-math.copysign(.43,lane)
+            diff=(desired-self.spec.lateral)-self.lateral_offset
+            self.lateral_offset+=math.copysign(min(abs(diff),.95*dt),diff) if abs(diff)>1e-6 else 0.
+            goal_crouch=.22
+            goal_aim=.44
+            if self.state_time>=.84:
+                self._transition('aiming')
+        else:
+            return False
+        self.pose_crouch+=(goal_crouch-self.pose_crouch)*(1.-math.exp(-dt*6.0))
+        self.pose_aim+=(goal_aim-self.pose_aim)*(1.-math.exp(-dt*5.0))
         return True
 
     def engage(self):
@@ -247,7 +401,8 @@ class EnemyAgent:
         if travelled>.00001:
             # Roughly one left+right step cycle per 1.25 m of travel.
             self.gait_phase=(self.gait_phase+travelled*math.tau/1.25)%math.tau
-        if self.state in ('scanning','peeking','hiding','locating','searching','alert'):
+        if self.state in ('scanning','peeking','hiding','locating','searching','alert',
+                          'seeking_cover','sheltered','cover_peek','suppressed'):
             target_look=.44*math.sin(self.total_time*(1.8+.15*self.tactical_difficulty.level)
                                        +self.spec.enemy_id*.61)
         else:
@@ -274,6 +429,16 @@ class EnemyAgent:
                 return
             self.blast_level=0
         self.state_time+=dt
+        if self.spec.exterior_side != 0 and self.state=='idle':
+            # Patrol is bounded and frame-time independent. Animation, shots,
+            # and world pose all consume this SAME continuously moving route_m.
+            self.route_m=(self.patrol_origin + 3.0*math.sin(
+                self.total_time*.32)*self.spec.exterior_side)
+            self.pose_aim+=(0.0-self.pose_aim)*(1.-math.exp(-dt*5.))
+            return
+        if self.state in ('suppressed','seeking_cover','sheltered','cover_peek'):
+            self._cover_movement(dt)
+            return
         if not visible and self.state in ('turning','aiming','firing','cover'):
             self._transition('searching')
         elif visible and self.state=='searching':
@@ -411,6 +576,36 @@ class EnemyDirector:
         self.last_hit=None
         self.gunshots_this_frame=()
 
+    def react_to_player_fire(self,route_m,cover_candidates=None,fallen_enemy_id=None):
+        """Bounded player-shot stimulus to nearby ALREADY alerted combatants.
+
+        Physical cover candidates come from the same deterministic prop list
+        that the game renders and its raycast intersects. Hearing a shot does
+        not grant visual awareness or a license to fire through earth.
+        """
+        responded=[]
+        for idx,agent in sorted(self.active.items()):
+            if agent.dead or not (0.0 < agent.route_m-route_m < 25.):
+                continue
+            if agent.state in ('idle','investigating'):
+                continue
+            cover=None
+            if cover_candidates is not None and not off_trunk(agent.spec):
+                candidates=cover_candidates(agent.route_m-5.0,agent.route_m+.3)
+                options=[ob for ob in candidates
+                         if ob.kind=='crate' and ob.height>=.78 and
+                         route_m+.7<ob.s<agent.route_m-.5 and
+                         agent.route_m-ob.s<=4.0]
+                if options:
+                    cover=min(options,key=lambda ob:(abs(agent.route_m-ob.s),
+                                abs(agent.spec.lateral-ob.lateral)))
+            ally_lost=(fallen_enemy_id is not None and
+                       (primary_for_partner(idx)==fallen_enemy_id or
+                        primary_for_partner(fallen_enemy_id)==idx))
+            if agent.react_to_fire(cover,ally_lost=ally_lost):
+                responded.append(idx)
+        return tuple(responded)
+
     def hear_shot(self,route_m,max_range=78.0):
         """Gunfire is a local cue. Returns IDs of newly alerted patrols.
 
@@ -423,13 +618,39 @@ class EnemyDirector:
                 alerted.append(idx)
         return tuple(alerted)
 
-    def update(self,dt,route_m,can_see_player=None):
+    def update(self,dt,route_m,can_see_player=None,branch_side_at=None):
         # First four remain fixed; later patrols are a denser but bounded 72m
         # grid. Never allocate enemies across the infinite level in advance.
         first=max(4,4+int(math.floor((route_m-105.-516.)/72.)))
         last=max(first+1,4+int(math.ceil((route_m+105.-516.)/72.)))
-        for idx in list(range(4))+list(range(first,last+1)):
-            spec=encounter_spec(idx)
+        primary_indices=list(range(4))+list(range(first,last+1))
+        # Companions are generated by the same bounded active window, not an
+        # infinite global registry. Their IDs and positions are deterministic.
+        specs=[]
+        for idx in primary_indices:
+            specs.append(encounter_spec(idx))
+            partner=encounter_partner_spec(idx)
+            if partner is not None:
+                specs.append(partner)
+        # Sparse stationary sentries in REAL side rooms. The game supplies
+        # junction_side() so this cannot diverge from world excavation sides.
+        if branch_side_at is not None:
+            first_branch=max(7,int(math.floor((route_m-100.-64.)/72.)))
+            last_branch=max(first_branch,int(math.ceil((route_m+100.-64.)/72.)))
+            for branch_i in range(first_branch,last_branch+1):
+                if branch_i%8!=7:continue
+                side=branch_side_at(branch_i)
+                specs.append(side_room_enemy_spec(branch_i,side))
+        # Sparse above-bank patrols: genuine world-ground positions and
+        # independent actors. They NEVER become blocking main-route threats.
+        ext_first=max(7,int(math.floor((route_m-100.-516.)/72.))+4)
+        ext_last=max(ext_first,int(math.ceil((route_m+100.-516.)/72.))+4)
+        for i in range(ext_first,ext_last+1):
+            if i%8==7:
+                specs.append(exterior_patrol_spec(i))
+        for spec in specs:
+            if spec is None:continue
+            idx=spec.enemy_id
             if idx in self.eliminated:continue
             if abs(spec.route_m-route_m)<=90.0:
                 self.active.setdefault(idx,EnemyAgent(spec))
@@ -447,9 +668,15 @@ class EnemyDirector:
             close=not agent.dead and 0.0<agent.route_m-route_m<=16.0
             visible=(can_see_player(agent) if can_see_player is not None and close else
                      can_see_player(agent) if can_see_player is not None and
-                     agent.state in ('turning','aiming','firing','cover','searching') else True)
+                     agent.state in ('turning','aiming','firing','cover','searching',
+                                     'suppressed','seeking_cover','sheltered','cover_peek') else True)
             if close and visible and agent.state in ('idle','investigating','alert'):
-                if agent.begin_tactical_encounter():
+                if off_trunk(agent.spec):
+                    # A room sentry uses ordinary reaction/aiming, not the
+                    # main-trench rushing FSM that would move him through dirt.
+                    agent.engage()
+                    self.contact_count+=1
+                elif agent.begin_tactical_encounter():
                     self.contact_count+=1
             before=agent.shots_fired
             agent.update(dt,visible=visible,player_route=route_m)
@@ -480,7 +707,8 @@ class EnemyDirector:
 
     def current_threat(self,route_m):
         candidates=[a for a in self.active.values()
-                    if a.threat and -3 < a.route_m-route_m < 24]
+                    if a.threat and not off_trunk(a.spec)
+                    and -3 < a.route_m-route_m < 24]
         return min(candidates,key=lambda a:a.route_m-route_m) if candidates else None
 
     def clamp_advance(self,route_m,travel):
@@ -805,6 +1033,15 @@ def enemy_parts(agent):
 
 def actor_facing(agent,heading):
     """Facing world yaw; patrol running DOWN the route faces sound source."""
+    if agent.spec.exterior_side != 0:
+        # Patroller follows a real bank-side route and periodically watches
+        # DOWN into the trench; only an actual visibility ray detects us.
+        sweep=.60*math.sin(agent.total_time*.74+agent.spec.enemy_id*.23)
+        return heading-agent.spec.exterior_side*(math.pi*.5+sweep)
+    if agent.spec.branch_index is not None:
+        # Stationary sentry looks out through the real side-branch portal.
+        return heading-agent.spec.branch_side*math.pi*.5 + (
+            .13*math.sin(agent.total_time*.8+agent.spec.enemy_id) if agent.state=='idle' else 0.)
     if agent.state=='investigating':return heading+math.pi
     if agent.state in ('idle','alert') and agent.spec.profile=='unaware':
         # A sentry gradually sweeps the trench. It must LOOK toward the player

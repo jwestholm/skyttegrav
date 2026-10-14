@@ -16,9 +16,12 @@ import sys
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from enemy_system import EnemyDirector, EnemyAgent, EnemySpec, actor_facing, enemy_parts, ray_from_screen
+from enemy_system import (EnemyDirector, EnemyAgent, EnemySpec, actor_facing,
+                          enemy_parts, ray_from_screen, encounter_partner_spec, off_trunk)
 from arcade_mode import ArcadeRun
-from combat_visibility import player_body, can_see_body, enemy_faces_player, enemy_shown_to_player
+from combat_visibility import (player_body,can_see_body,enemy_faces_player,
+                              enemy_shown_to_player,mesh_clear_body,
+                              enemy_shown_to_player_mesh)
 from combat_tactics import difficulty_at, MATERIALS, tactical_cover_lane
 from death_screen import DeathScreen
 from shadow_lighting import ShadowRenderer, SHADOW_GLSL
@@ -1396,6 +1399,40 @@ class TrenchObstacle:
     detour: float = 0.0
 
 
+def paired_cover_at(index):
+    """One real grounded crate beside SOME paired enemies, 360m apart.
+
+    Both static scene mesh and LOS/nav queries call this deterministic layout.
+    Not a floating animation-only bunker or an invisible protected state.
+    """
+    partner=encounter_partner_spec(index)
+    if partner is None:return None
+    s=partner.route_m-1.25
+    if near_junction(s,6.0) or tunnel_drop(s)<-.10:
+        return None
+    side=-1 if partner.lateral<0 else 1
+    # Leave a walkable central lane and respect the excavated bank width.
+    minimum_width=min(wall_width(s+d,side) for d in (-.6,0.,.6))
+    if minimum_width<.88:return None
+    width=.41
+    lateral=side*min(abs(partner.lateral),minimum_width-width*.5-.06)
+    return TrenchObstacle(-200000-index,s,'crate',lateral,.67,width,.98,
+                           -side*.30)
+
+
+def paired_covers_in_range(start,end):
+    """O(visible distance / 360m), deterministic across chunk boundaries."""
+    if end<start:return []
+    first=max(0,math.floor((start-520.)/360.)-1)
+    last=max(0,math.ceil((end-515.)/360.)+1)
+    found=[]
+    for k in range(first,last+1):
+        ob=paired_cover_at(4+5*k)
+        if ob is not None and start<=ob.s<=end:
+            found.append(ob)
+    return found
+
+
 def trench_obstacle(index):
     """Deterministic obstruction with measured walking clearance.
 
@@ -1405,6 +1442,11 @@ def trench_obstacle(index):
     if index < 0:
         return None
     s = 15.0 + OBSTACLE_SPACING*index + (noise(index,401)-.5)*4.0
+    # Reserved side-wall tactical cover replaces overlapping ordinary
+    # clutter. There must never be two interpenetrating collision objects.
+    nearby_pair=int(round((s-517.2)/360.0))
+    if nearby_pair>=0 and abs(s-(517.2+360.*nearby_pair))<2.25:
+        return None
     if tunnel_drop(s)<-.10:
         return None  # avoid unseen raised obstacles inside sloping tunnel
     j=nearest_junction(s)
@@ -1462,6 +1504,7 @@ def obstacles_in_range(start, end):
         ob=trench_obstacle(i)
         if ob is not None and start<=ob.s<=end:
             result.append(ob)
+    result.extend(paired_covers_in_range(start,end))
     return result
 
 
@@ -2846,6 +2889,7 @@ class SoldierBrain:
         # This bounded per-run memory is part of the EXISTING SoldierBrain.
         self.branch_evidence={}
         self.last_branch_decision=None
+        self.routine_rooms_cleared=0  # successful physical traversal, not guesses
         # A branch with no local evidence gets ONE brief, real corner check,
         # followed by a watched pass. This is not a room-clear/search action.
         self.passing_branch=None
@@ -3016,6 +3060,14 @@ class SoldierBrain:
     def _should_enter_branch(self,index):
         signal=self.branch_evidence.get(index)
         return bool(signal and signal[1]>=.65)
+
+    def _routine_room_check(self,index):
+        """Occasional non-combat search; never implies an invisible enemy.
+
+        Deterministic and sparse. Tutorial branches / early tested encounters
+        remain unchanged. Calls the EXISTING real side-branch movement FSM.
+        """
+        return bool(index>=6 and index%6==2 and branch_type(index)=='dugout')
 
     def _depth_to_check(self,index):
         """Prototype estimate only: not physical visibility."""
@@ -3335,17 +3387,21 @@ class SoldierBrain:
                     self._start('observe_assess',.35,
                                 'bedömer det han faktiskt kunnat observera')
                 elif self.state=='observe_assess':
-                    # Evidence is checked AFTER the peek, so a sound/movement
-                    # reported during inspection can change the decision.
-                    if self._should_enter_branch(i):
-                        self.last_branch_decision=(i,'investigate')
+                    # Real evidence overrides routine curiosity. A seeded
+                    # empty-room check is a BEHAVIOR choice, not enemy evidence.
+                    actual_evidence=self._should_enter_branch(i)
+                    routine=self._routine_room_check(i)
+                    if actual_evidence or routine:
+                        self.last_branch_decision=(i,'investigate' if actual_evidence else 'routine_search')
                         self.investigate_depth=self._depth_to_check(i)
                         if self.investigate_depth<.15:
                             self._start('branch_rest',.40,
                                         'sidogången kan kontrolleras från öppningen')
                         else:
                             self._start('move_to_mouth',.12,
-                                        'lokaliserad aktivitet — undersöker sidogången')
+                                ('lokaliserad aktivitet — undersöker sidogången'
+                                 if actual_evidence else
+                                 'rutinkontrollerar ett skyddsrum utan larm'))
                     else:
                         self.last_branch_decision=(i,'observe_only')
                         self.passing_branch=i
@@ -3377,7 +3433,7 @@ class SoldierBrain:
                 elif self.state=='retract':
                     self._start('assess',.35+noise(i,205)*.45,'bedömer gången')
                 elif self.state=='assess':
-                    if not self._should_enter_branch(i):
+                    if not (self._should_enter_branch(i) or self._routine_room_check(i)):
                         # Observation only: no evidence of enemy in a SIDE
                         # tunnel, no reason to clear it on every encounter.
                         # Stay in protected position, breathe, then resume.
@@ -3385,13 +3441,15 @@ class SoldierBrain:
                         self._start('branch_rest',.55+.55*noise(i,2207),
                                     'sidogången verkar tom — lyssnar och hämtar andan')
                     else:
-                        self.last_branch_decision=(i,'investigate')
+                        actual_evidence=self._should_enter_branch(i)
+                        self.last_branch_decision=(i,'investigate' if actual_evidence else 'routine_search')
                         self.investigate_depth=self._depth_to_check(i)
                         if self.investigate_depth<.15:
                             self._start('branch_rest',.4,'sidogången redan överblickbar')
                         else:
                             self._start('move_to_mouth',.12,
-                                        'misstänkt aktivitet — går in och undersöker')
+                                ('misstänkt aktivitet — går in och undersöker' if actual_evidence
+                                 else 'söker igenom ett rum på rutin'))
                 elif self.state=='branch_rest':
                     self.state='main'
                     self.phase='fortsätter huvudgången efter avsökning'
@@ -3501,6 +3559,8 @@ class SoldierBrain:
             self.branch_progress+=travel
             if self.branch_progress>=self.investigate_depth-.015:
                 if branch_type(self.branch_index)=='dugout':
+                    if self.last_branch_decision==(self.branch_index,'routine_search'):
+                        self.routine_rooms_cleared+=1
                     self._start('dugout_clear',1.45+noise(self.branch_index,2932)*.7,
                                 'knästående söker av skyddsrummet')
                 else:
@@ -4347,6 +4407,24 @@ class Trench:
         return target
 
     def enemy_position(self,spec):
+        if spec.exterior_side != 0:
+            director=getattr(self,'enemies',None)
+            agent=director.active.get(spec.enemy_id) if director is not None else None
+            route_m=agent.route_m if agent is not None else spec.route_m
+            # Same hill function used for the actual exterior terrain mesh.
+            # A small additional clearance avoids sinking into the rim and
+            # leaves the actor above the bank, never inside the trench.
+            side=spec.exterior_side
+            offset=side*(wall_width(route_m,side)+spec.exterior_clearance)
+            return world_on_ground(route_m,offset)
+        if spec.branch_index is not None:
+            # Real branch-floor pose, also used for frozen hit spheres.
+            # Side tunnels are geometry, not fake screen offsets.
+            index=spec.branch_index
+            depth=spec.branch_depth
+            floor=floor_y(junction_marker(index),0.) + .025*math.sin(
+                  depth*.79+index*.73)
+            return branch_point(index,spec.branch_side,depth,0.,floor)
         # Render, effects and shot-frozen hit centres share the SAME dynamic
         # route position. No visual/physical position divergence when running.
         director=getattr(self,'enemies',None)
@@ -4359,7 +4437,8 @@ class Trench:
             # for a soldier's BODY width rather than only the camera eye.
             lateral+=obstacle_steering(route_m)
             for ob in obstacles_in_range(route_m-3.2,route_m+3.2):
-                if ob.kind not in ('crate','rubble') or not ob.detour:
+                if (ob.kind not in ('crate','rubble') or not ob.detour or
+                    (agent is not None and ob.index==agent.cover_obstacle_id)):
                     continue
                 # Standing human shoulder/pack half-width ~0.32m. An actor
                 # must clear the actual rendered obstacle, not pass its centre.
@@ -4402,6 +4481,9 @@ class Trench:
                 self.last_shot_cover=cover_name(obstruction.layer)
                 return True
             return False
+        # A branch enemy cannot use the main-route fallback: that proxy is
+        # not valid inside actual side excavation. Better refuse the shot.
+        if agent.spec.branch_index is not None:return True
         # Conservative fallback only if there is no loaded collision mesh.
         # Geometry along the main corridor: use closest local path point.
         start=max(0.,(self.distance if route_at_shot is None else route_at_shot)-3.0)
@@ -4471,6 +4553,13 @@ class Trench:
         # Any player gunfire can be heard by main-route patrols, regardless
         # of hit/miss. Hearing never fakes a physical hit or eliminates anyone.
         self.arcade.player_shot(result)
+        # A nearby ALREADY ENGAGED opponent can seek a real mesh-backed
+        # crate. Hearing player fire does not reveal any hidden enemy to us.
+        cover_signal=getattr(self.enemies,'react_to_player_fire',None)
+        reactions=(cover_signal(self.distance,obstacles_in_range,
+                   fallen_enemy_id=result[0] if result else None)
+                   if callable(cover_signal) else ())
+        if reactions:print(f'FIENDER SÖKER SKYDD: {reactions}')
         heard=self.enemies.hear_shot(self.distance)
         if heard:print(f'FIENDER HÖR SKOTT: {heard}')
         if result:
@@ -4689,8 +4778,17 @@ class Trench:
             for idx in list(self.visible_opportunity_seconds):
                 if idx not in active_ids:self.visible_opportunity_seconds.pop(idx,None)
             for idx in active_ids:
-                self.player_can_shoot[idx]=enemy_shown_to_player(
-                    self.last_enemy_frame,idx,eye,geometry=geo)
+                actor=self.enemies.active.get(idx)
+                if actor is not None and off_trunk(actor.spec):
+                    shown=enemy_shown_to_player_mesh(self.last_enemy_frame,idx,eye)
+                    self.player_can_shoot[idx]=shown
+                    if shown and self.auto and actor.spec.branch_index is not None:
+                        # Only a side-room sentry contributes room evidence.
+                        self.brain.report_branch_evidence(
+                            actor.spec.branch_index,'seen_enemy',1.0)
+                else:
+                    self.player_can_shoot[idx]=enemy_shown_to_player(
+                        self.last_enemy_frame,idx,eye,geometry=geo)
         for idx,shown in self.player_can_shoot.items():
             prev=self.visible_opportunity_seconds.get(idx,0.0)
             self.visible_opportunity_seconds[idx]=(
@@ -4699,7 +4797,9 @@ class Trench:
             if agent.spec.enemy_id not in self.player_visibility:
                 px,ground,pz=self.enemy_position(agent.spec)
                 origin=(px,ground+1.48,pz)
-                visible=can_see_body(origin,body,agent.route_m,self.distance,**geo)
+                visible=(mesh_clear_body(origin,body,self.last_world_shot_meshes)
+                         if off_trunk(agent.spec) else
+                         can_see_body(origin,body,agent.route_m,self.distance,**geo))
                 self.player_visibility[agent.spec.enemy_id]=visible
             if not self.player_visibility[agent.spec.enemy_id]:
                 return False
@@ -4710,7 +4810,8 @@ class Trench:
                 facing=actor_facing(agent,route(agent.route_m)[2])
                 return enemy_faces_player(pos,eye,facing)
             return True
-        self.enemies.update(dt,self.distance,can_see_player=visibility)
+        self.enemies.update(dt,self.distance,can_see_player=visibility,
+                            branch_side_at=junction_side)
         for enemy_id in self.enemies.gunshots_this_frame:
             enemy=self.enemies.active.get(enemy_id)
             if enemy is None or enemy.dead:continue
@@ -4719,8 +4820,12 @@ class Trench:
             # Always re-evaluate geometry at the actual hostile-shot event.
             fresh_eye=self.enemy_position(enemy.spec)
             current_body=player_body(eye,self.height)
-            shots_visible=can_see_body((fresh_eye[0],fresh_eye[1]+1.48,fresh_eye[2]),
-                current_body,enemy.route_m,self.distance,**geo)
+            from_enemy=(fresh_eye[0],fresh_eye[1]+1.48,fresh_eye[2])
+            shots_visible=(mesh_clear_body(from_enemy,current_body,
+                          self.last_world_shot_meshes)
+                          if off_trunk(enemy.spec) else
+                          can_see_body(from_enemy,current_body,
+                                       enemy.route_m,self.distance,**geo))
             clear=bool(shots_visible)
             self.player_visibility[enemy_id]=shots_visible
             cfg=difficulty_at(self.distance)
