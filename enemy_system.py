@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from combat_tactics import difficulty_at
+from combat_tactics import difficulty_at, encounter_lateral
 
 
 @dataclass(frozen=True)
@@ -41,11 +41,13 @@ def encounter_spec(index):
     """Stable, bounded lookups; no million-enemy registry or RNG state."""
     if index < 0:
         raise ValueError('encounter index must be non-negative')
+    # Known four encounter positions remain at the same route metres.
+    # Physical flank placement replaces the nearly centered spawn lanes.
     first = (
-        (32.0, -.18, 'unaware'),
-        (164.0, .14, 'ambush'),
-        (258.0, -.15, 'cover'),
-        (384.0, .12, 'unaware'),
+        (32.0, -.43, 'unaware'),
+        (164.0, .51, 'ambush'),
+        (258.0, .38, 'cover'),
+        (384.0, -.48, 'unaware'),
     )
     if index < len(first):
         s, lateral, kind = first[index]
@@ -55,7 +57,7 @@ def encounter_spec(index):
         # first is 516 (junctions 496/568), then 588, 660, ...
         # Side-branch spawns and hiding are deliberately not faked here.
         s = 516.0 + (index-4)*72.0
-        lateral = -.12 if index % 2 else .12
+        lateral = encounter_lateral(index)
         kind = ('ambush','cover','unaware')[index % 3]
     return EnemySpec(index, s, lateral, kind)
 
@@ -386,6 +388,7 @@ class FrozenEnemyFrame:
     route_m: float
     hit_spheres: tuple  # (enemy_id, part_name, world_center, radius)
     actor_routes: tuple = ()  # immutable (enemy_id, frozen route_m) for LOS
+    world_shot_meshes: tuple = ()  # actual PRESENTED static triangles; refs, no copy
 
 
 class EnemyDirector:

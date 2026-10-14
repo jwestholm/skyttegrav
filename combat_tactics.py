@@ -68,3 +68,21 @@ def projected_visible(point, matrix, width, height, *, margin=.07):
     return bool(-1+margin < xyz[0] < 1-margin and
                 -1+margin < xyz[1] < 1-margin and
                 -1 <= xyz[2] <= 1)
+
+
+def encounter_lateral(enemy_id):
+    """Stable lateral body position (metres), never a screen-coordinate shift."""
+    index=int(enemy_id)
+    if index<0:raise ValueError('enemy_id must be non-negative')
+    magnitude=.30+.34*(.5+.5*math.sin((index+17)*2.399963229728653))
+    side=1 if math.sin(index*1.823+.37)>0.0 else -1
+    return side*magnitude
+
+
+def tactical_cover_lane(enemy_lateral, route_m, wall_width):
+    """World-space cover lane opposite a known enemy; leave real body clearance."""
+    enemy_lateral=float(enemy_lateral)
+    if not math.isfinite(enemy_lateral):return 0.0
+    side=-1 if enemy_lateral>=0 else 1
+    clearance=max(0.0,float(wall_width(float(route_m),side))-.49)
+    return side*min(.51,clearance)*.82

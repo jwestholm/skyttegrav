@@ -8,6 +8,7 @@ No animation root motion is ever added to world position.
 from __future__ import annotations
 import math
 from functools import lru_cache
+from dataclasses import dataclass
 import numpy as np
 from enemy_system import EnemyAgent,EnemySpec
 from enemy_system import actor_joints
@@ -180,24 +181,27 @@ def _joints(agent, pose):
             shoulder=torso+np.array((s*.29,.22,-.01))
             elbow=torso+np.array((s*.29,.47,-.13))
             hand=torso+np.array((s*.14,.68,.09+ .35*math.sin(agent.total_time*6.)))
-        elif pose in ('aim','fire'):
-            elbow=torso+np.array((s*.33,.035,.15))
-            hand=torso+np.array((s*.11,.10,.43))
-        elif pose=='base':
-            # Reuse EnemyAgent's smoothly interpolated aim channel. Stance,
-            # breath and gait use the same pose channels as hit regions.
-            aim=float(agent.aim_fraction())
-            elbow+=np.array((0.,.10*aim,.06*aim))
-            hand+=np.array((0.,.32*aim,.19*aim))
+        if pose in ('aim','fire','base'):
+            # A shouldered rifle: right hand at trigger/stock, left hand well
+            # forward under the fore-end; the sight line lies below the eye.
+            # The normal AI channels use the same *continuous* aim_fraction.
+            aim=1.0 if pose in ('aim','fire') else max(0.,min(1.,float(agent.aim_fraction())))
+            shoulder_elbow=torso+np.array((s*.32,.10,.19))
+            shouldered_hand=torso+np.array((s*.115,.32 if i==0 else .27,.60 if i==0 else .34))
+            elbow=elbow*(1.-aim)+shoulder_elbow*aim
+            hand=hand*(1.-aim)+shouldered_hand*aim
+            if pose=='base' and aim>.95:
+                # Avoid an exaggerated barrel sway while sighting.
+                hand+=np.array((0.,.003*math.sin(t*1.8+agent.spec.enemy_id),0.))
         if pose in ('walk','run','base') and movement>.02:
             # Arms counter-rotate relative to the legs; weapon aim suppresses
             # this swing so fighting actors do not wave the gun around.
             aim=float(agent.aim_fraction()) if pose=='base' else 0.0
-            swing=(.075 if pose=='walk' else .16 if pose=='run' else .12*movement)
+            swing=(.045 if pose=='walk' else .085 if pose=='run' else .065*movement)
             wave=math.sin(cycle+math.pi*i)
             swing*=max(0.0,1.0-aim)
             elbow=elbow+np.array((0.,.023*wave,swing*wave))
-            hand=hand+np.array((0.,.020*wave,swing*wave*1.35))
+            hand=hand+np.array((0.,.020*wave,swing*wave*1.12))
         if pose in ('fire','base'):
             # Short shoulder impulse; the hands and gun recoil together. Fire
             # in the pose lab repeats at a legible, fixed demonstration cadence.
@@ -340,3 +344,99 @@ def bone_matrices(agent,pose='auto'):
 
 def selected_visual_pose(agent,override=None):
     return 'auto' if override is None else override
+
+
+# V3.9.6: diagnostic command-driven pose transitions. These matrices are
+# visualization-only; game navigation and shot-frozen collision authority stay
+# with EnemyAgent/EnemyDirector. No CPU mesh buffers are modified per frame.
+
+def _rotation_quat(r):
+    """Stable proper rotation -> unit quaternion (w,x,y,z)."""
+    r=np.asarray(r,dtype=np.float64)
+    trace=float(np.trace(r))
+    if trace>0.0:
+        t=math.sqrt(max(0.,trace+1.))*2.
+        q=(.25*t,(r[2,1]-r[1,2])/t,(r[0,2]-r[2,0])/t,(r[1,0]-r[0,1])/t)
+    else:
+        i=int(np.argmax(np.diag(r)))
+        if i==0:
+            t=math.sqrt(max(1.e-12,1.+r[0,0]-r[1,1]-r[2,2]))*2.
+            q=((r[2,1]-r[1,2])/t,.25*t,(r[0,1]+r[1,0])/t,(r[0,2]+r[2,0])/t)
+        elif i==1:
+            t=math.sqrt(max(1.e-12,1.+r[1,1]-r[0,0]-r[2,2]))*2.
+            q=((r[0,2]-r[2,0])/t,(r[0,1]+r[1,0])/t,.25*t,(r[1,2]+r[2,1])/t)
+        else:
+            t=math.sqrt(max(1.e-12,1.+r[2,2]-r[0,0]-r[1,1]))*2.
+            q=((r[1,0]-r[0,1])/t,(r[0,2]+r[2,0])/t,(r[1,2]+r[2,1])/t,.25*t)
+    a=np.asarray(q,dtype=np.float64)
+    return a/max(1.e-12,float(np.linalg.norm(a)))
+
+
+def _quat_rotation(q):
+    w,x,y,z=q
+    return np.array(((1.-2.*(y*y+z*z),2.*(x*y-z*w),2.*(x*z+y*w)),
+                     (2.*(x*y+z*w),1.-2.*(x*x+z*z),2.*(y*z-x*w)),
+                     (2.*(x*z-y*w),2.*(y*z+x*w),1.-2.*(x*x+y*y))),dtype=np.float32)
+
+
+def interpolate_bone_matrices(source,target,alpha):
+    """Rigid 16-bone transform blend; no stretching limbs via matrix lerp."""
+    a=np.asarray(source,dtype=np.float32)
+    b=np.asarray(target,dtype=np.float32)
+    if a.shape!=b.shape or a.shape!=(len(BONES),4,4):
+        raise ValueError('Incompatible bone palettes')
+    amount=max(0.,min(1.,float(alpha)))
+    if not math.isfinite(float(alpha)):raise ValueError('non-finite transition')
+    if amount<=0:return a.copy()
+    if amount>=1:return b.copy()
+    out=np.zeros_like(a)
+    out[:,3,3]=1.
+    out[:,:3,3]=a[:,:3,3]*(1.-amount)+b[:,:3,3]*amount
+    for i in range(len(BONES)):
+        qa=_rotation_quat(a[i,:3,:3]); qb=_rotation_quat(b[i,:3,:3])
+        d=float(np.dot(qa,qb))
+        if d<0:qb=-qb;d=-d
+        if d>.9995:q=qa*(1.-amount)+qb*amount
+        else:
+            angle=math.acos(max(-1.,min(1.,d)))
+            sin_angle=math.sin(angle)
+            q=(qa*math.sin((1.-amount)*angle)+qb*math.sin(amount*angle))/sin_angle
+        q=q/max(1.e-12,float(np.linalg.norm(q)))
+        out[i,:3,:3]=_quat_rotation(q)
+    return out
+
+
+@dataclass
+class PoseTransition:
+    """F1 demo controller: commands produce transitions, not hard pose switches.
+
+    The same frozen palette is handed to both depth-shadow and color pass.
+    Production enemies continue using EnemyAgent's existing live pose channels.
+    """
+    pose: str='stand'
+    duration: float=.44
+    elapsed: float=1.0
+    source: np.ndarray | None=None
+
+    def sample(self,agent):
+        target=bone_matrices(agent,self.pose)
+        if self.source is None or self.elapsed>=self.duration:
+            return target
+        t=max(0.,min(1.,self.elapsed/max(.001,self.duration)))
+        smooth=t*t*(3.-2.*t)
+        return interpolate_bone_matrices(self.source,target,smooth)
+
+    def request(self,pose,agent):
+        if pose not in POSE_LAB:raise ValueError('unknown diagnostic pose')
+        if pose==self.pose:return
+        self.source=self.sample(agent).copy()  # interrupt from what was displayed
+        self.pose=pose
+        slow={'kneel':.73,'prone':.93,'supine_sleep':1.00,
+              'fear_curl':.83,'dead':1.02,'spade_attack':.48}
+        self.duration=slow.get(pose,.42)
+        self.elapsed=0.
+
+    def advance(self,dt):
+        if not math.isfinite(float(dt)) or dt<0:raise ValueError('invalid delta time')
+        self.elapsed=min(self.duration,max(0.,self.elapsed+float(dt)))
+        if self.elapsed>=self.duration:self.source=None

@@ -1,0 +1,17 @@
+63f7b34db8d8cdea90c76aacccf841ec
+::res://::1791964826
+BRIDGE_ARCHITECTURE.md::TextFile::-1::1791954978::0::1::::<><><>0<>0<><>::
+main.tscn::PackedScene::-1::1791954684::0::1::::<><><>0<>0<><>::res://scripts/main.gd<>res://scripts/soldier_visual.gd
+README.md::TextFile::-1::1791954820::0::1::::<><><>0<>0<><>::
+::res://assets/::1791964082
+README_ASSETS.md::TextFile::-1::1791954820::0::1::::<><><>0<>0<><>::
+::res://bridge/::1791964082
+::res://scripts/::1791964798
+main.gd::GDScript::2283922338940553143::1791957260::0::1::::<>Node3D<><>0<>0<><>::
+soldier_visual.gd::GDScript::8006108374967116262::1791955096::0::1::::<>Node3D<><>0<>0<><>::
+::res://tests/::1791964082
+::res://world/::1791964281
+chunk_000.glb::PackedScene::4881897891331419234::1791954556::1791964280::1::::<><><>0<>0<>74017ba6f8c6d53bdff0444d34e5072b<>res://.godot/imported/chunk_000.glb-8bda81f0fff8309389c3962981adbd5f.scn::
+chunk_001.glb::PackedScene::341786922610018291::1791954558::1791964281::1::::<><><>0<>0<>bb562c2a36888ac6f5637d1d5cab2a56<>res://.godot/imported/chunk_001.glb-b417a59ee1a70cfb2e5d21ab8d838c30.scn::
+manifest.json::JSON::-1::1791954558::0::1::::<><><>0<>0<><>::
+route_samples.json::JSON::-1::1791954558::0::1::::<><><>0<>0<><>::

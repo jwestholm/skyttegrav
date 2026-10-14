@@ -209,7 +209,9 @@ class SkeletalEnemyRenderer:
             angle=actor_facing(agent,heading_at(agent.route_m))
             model=self._model_matrix(pos,angle)
             pose=getattr(agent,'pose_preview',None)
-            bones=bone_matrices(agent,'auto' if pose is None else pose)
+            controller=getattr(agent,'pose_controller',None)
+            bones=(controller.sample(agent) if controller is not None
+                   else bone_matrices(agent,'auto' if pose is None else pose))
             out.append((agent.spec.enemy_id%3,model,bones,agent))
         return out
 
