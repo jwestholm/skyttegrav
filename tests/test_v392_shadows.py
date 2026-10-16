@@ -22,8 +22,10 @@ class ShadowMatrixTests(unittest.TestCase):
         self.assertTrue(np.isfinite(a).all())
         self.assertTrue(np.isfinite(b).all())
         self.assertFalse(np.allclose(a,b))
-        # Camera movement smaller than a 0.5m snap leaves the light volume stable.
-        self.assertTrue(np.allclose(a,directional_matrix((.12,1.55,.17),sun)))
+        # Fixed world points stay on whole light-space texels while moving.
+        shifted=directional_matrix((.12,1.55,.17),sun)
+        delta=(shifted[:2,3]-a[:2,3])*1536*.5
+        np.testing.assert_allclose(delta,np.round(delta),atol=1e-4)
         centre=np.array([0,1.4,0,1.])
         for mat in (a,b):
             p=mat@centre;p/=p[3]
@@ -123,10 +125,10 @@ class ShadowGPULifecycleTests(unittest.TestCase):
                 self.assertEqual(ctx.screen.used,1)
                 self.assertEqual(ctx.viewport,(0,0,800,600))
                 self.assertEqual([f.cleared for f in ctx.framebuffers],[1,1,1])
-                self.assertEqual(len(shadows.world_vaos),2)
+                self.assertEqual(len(shadows.world_vaos),3)
                 self.assertEqual(len(shadows.actor_vaos),1)
                 self.assertTrue(all(t[1].released is False for t in ctx.textures))
-                self.assertEqual(len(ctx.vaos),3)
+                self.assertEqual(len(ctx.vaos),4)
                 shadows.bind_material(program)
                 self.assertEqual([program[k].value for k in
                     ('shadow_mode','shadow_lamp_index')],[1,0])
@@ -134,7 +136,7 @@ class ShadowGPULifecycleTests(unittest.TestCase):
                                     for i,t in enumerate(ctx.textures)))
                 shadows.draw_maps(chunks,actors,instances,(1,1.5,1),[(1,1.8,1)],
                                   (800,600),0,2.)
-                self.assertEqual(len(ctx.vaos),3)  # no repeated GL VAO allocation
+                self.assertEqual(len(ctx.vaos),4)  # no repeated GL VAO allocation
                 self.assertEqual(ctx.screen.used,2)
                 old=shadows.world_vaos[0][1]
                 chunks.pop(0)

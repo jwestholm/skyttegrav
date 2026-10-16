@@ -69,6 +69,8 @@ class DeathScreen:
         self.text_program['tex'].value=0
         self._texture=None
         self._key=None
+        self._status_key=None
+        self._status_texture=None
 
     def _make_card(self,stats,w,h):
         import pygame
@@ -82,7 +84,8 @@ class DeathScreen:
                (f'Dödade {stats.kills} fiender',medium,(230,224,212)),
                (f'Sköt {stats.shots} skott',medium,(230,224,212)),
                (f'TOTALA POÄNG: {stats.score}',medium,(245,194,155)),
-               ('Tryck R för att spela igen',small,(188,183,176))]
+               ('R: Starta om (samma seed)',small,(188,183,176)),
+               ('S: Ny bana',small,(188,183,176))]
         line_heights=[int(font.get_height()*1.23) for _,font,_ in lines]
         start=max(14,(h-sum(line_heights))//2)
         for (text,font,color),advance in zip(lines,line_heights):
@@ -113,7 +116,34 @@ class DeathScreen:
         finally:
             self.ctx.enable(moderngl.DEPTH_TEST)
 
+    def draw_status(self,lines,w,h):
+        """Small cached status card using the existing text shader/quad."""
+        import pygame
+        import moderngl
+        key=tuple(lines)
+        width=min(640,max(200,w-24));height=26*len(lines)+10
+        if self._status_key!=(key,width):
+            surface=pygame.Surface((width,height),pygame.SRCALPHA,32)
+            surface.fill((12,17,15,190))
+            font=pygame.font.Font(None,23)
+            for i,line in enumerate(lines):
+                surface.blit(font.render(line,True,(235,237,222)),(8,5+i*26))
+            if self._status_texture is not None:self._status_texture.release()
+            self._status_texture=self.ctx.texture((width,height),4,pygame.image.tostring(surface,'RGBA',True))
+            self._status_key=(key,width)
+        viewport=self.ctx.viewport
+        try:
+            self.ctx.disable(moderngl.DEPTH_TEST)
+            self.ctx.viewport=(12,max(0,h-height-12),width,height)
+            self.text_program['opacity'].value=1.
+            self._status_texture.use(location=0)
+            self.text_vao.render(moderngl.TRIANGLES)
+        finally:
+            self.ctx.viewport=viewport
+            self.ctx.enable(moderngl.DEPTH_TEST)
+
     def release(self):
+        if self._status_texture is not None:self._status_texture.release()
         if self._texture is not None:self._texture.release()
         self.vao.release();self.vbo.release();self.program.release()
         self.text_vao.release();self.text_vbo.release();self.text_program.release()

@@ -40,7 +40,9 @@ class VisualWorldV27Tests(unittest.TestCase):
         self.assertIn('texture_array((TEXTURE_SIZE,TEXTURE_SIZE,len(frames))',CODE)
 
     def test_decorative_props_finite_bounded_and_seeded(self):
-        m=self.r
+        # Exercise the real generator and its helpers, not the V2.6 AST whitelist.
+        from test_v391_atomic_streaming import game
+        m=vars(game)
         class Mesh:
             def __init__(self):self.out=[]
             def quad(self,*values):

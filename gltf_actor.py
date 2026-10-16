@@ -400,8 +400,8 @@ class GLBSkinnedRenderer:
             ind=ctx.buffer(np.ascontiguousarray(part.indices).tobytes())
             vao=ctx.vertex_array(self.program,[(buf,'3f 3f 2f 4f 4f',
                       'in_pos','in_normal','in_uv','in_joints','in_weights')],ind)
-            shvao=ctx.vertex_array(self.shadow_program,[(buf,'3f 3f 2f 4f 4f',
-                      'in_pos','in_normal','in_uv','in_joints','in_weights')],ind)
+            shvao=ctx.vertex_array(self.shadow_program,[(buf,'3f 20x 4f 4f',
+                      'in_pos','in_joints','in_weights')],ind)
             if part.albedo:
                 im=Image.open(io.BytesIO(part.albedo)).convert('RGBA')
                 # GLB texcoords originate top left for common glTF images.
@@ -503,3 +503,230 @@ class GLBSkinnedRenderer:
         for buf in self.buffers:buf.release()
         self.joint_texture.release()
         self.program.release();self.shadow_program.release()
+
+
+class TacticalEnemyRenderer(GLBSkinnedRenderer):
+    """Authored tactical skin fitted offline to the EXISTING visual bone palette.
+
+    No animation clock, root motion, AI or hit regions are owned by this class.
+    Four-weight skinning retains smooth joints. Render-only grip and fall
+    corrections adapt the existing poses to this continuous authored skin.
+    """
+    def __init__(self,ctx,path,sun,moon):
+        super().__init__(ctx,path,sun,moon)
+        if self.asset.joint_count!=16:
+            self.release()
+            raise GLBError('tactical asset must use the existing 16-bone palette')
+        self._prepare_contacts()
+
+    @staticmethod
+    def living_palette(actor,override=None):
+        # Visual-only adaptation of the existing joint sampler. Locomotion is
+        # still driven by actual travelled distance; no animation root motion.
+        from copy import copy
+        from skeletal_pose import bone_matrices,_bind_joints,_joints,_matrix
+        proxy=copy(actor)
+        mode='auto' if override is None else override
+        if override in ('walk','run'):
+            proxy.gait_strength=.65 if override=='walk' else .85
+            proxy.gait_phase=actor.total_time*(5.8 if override=='walk' else 10.8)
+            proxy.gait_speed_mps=1.2 if override=='walk' else 2.8
+            mode='auto'
+        else:proxy.gait_strength=float(getattr(actor,'gait_strength',0.))*.72
+        palette=bone_matrices(proxy,mode)
+        base=_bind_joints();target=_joints(proxy,'base')
+        aim=1. if override in ('aim','fire') else float(actor.aim_fraction())
+        if override=='stand':aim=0.
+        # Both wrists belong to one rigid rifle, rather than counter-swinging
+        # independently while its bone only follows their midpoint.
+        rear=np.array((.02,1.02,.27))
+        anchor=target['torso']+np.array((.02,-.13+.30*aim,.225+.06*aim))
+        kick=(.035*math.exp(-max(0.,actor.state_time)*19.) if actor.state=='firing' else 0.)
+        anchor[2]-=kick
+        pitch=.12*(1.-aim);c,s=math.cos(pitch),math.sin(pitch)
+        rotation=np.array(((1.,0.,0.),(0.,c,-s),(0.,s,c)))
+        weapon=np.eye(4,dtype='f4');weapon[:3,:3]=rotation;weapon[:3,3]=anchor-rotation@rear
+        palette[15]=weapon
+        for i in range(2):
+            shoulder=target['shoulders'][i]
+            grip=np.array((.02,1.02,.45 if i==0 else .27))
+            hand=rotation@grip+weapon[:3,3]
+            upper=np.linalg.norm(base['elbows'][i]-base['shoulders'][i])
+            lower=np.linalg.norm(base['hands'][i]-base['elbows'][i])
+            delta=hand-shoulder;dist=np.linalg.norm(delta);axis=delta/max(dist,1e-8)
+            # Preserve bone length; choose an outward/downward elbow bend.
+            dist=min(dist,upper+lower-.001);hand=shoulder+axis*dist
+            bend=np.array((-.8 if i==0 else .8,-.5,-.2))
+            bend-=axis*np.dot(bend,axis);bend/=max(np.linalg.norm(bend),1e-8)
+            along=(upper*upper-lower*lower+dist*dist)/(2*dist)
+            elbow=shoulder+axis*along+bend*math.sqrt(max(0.,upper*upper-along*along))
+            k=3+i*3
+            palette[k]=_matrix(base['shoulders'][i],shoulder,base['elbows'][i],elbow)
+            palette[k+1]=_matrix(base['elbows'][i],elbow,base['hands'][i],hand)
+            palette[k+2]=_matrix(base['hands'][i],hand,base['elbows'][i],elbow)
+        # Solve each leg as a linked hip/knee/ankle chain. The old independent
+        # knee target could bend behind the ankle and change segment lengths.
+        # The forward bend plane keeps knees over toes, without lateral splay.
+        movement=float(getattr(proxy,'gait_strength',0.))
+        if override=='stand':movement=0.
+        phase=float(getattr(proxy,'gait_phase',0.))
+        speed=min(1.,max(0.,float(getattr(proxy,'gait_speed_mps',0.)))/2.8)
+        for i in range(2):
+            hip=target['hips'][i].copy()
+            upper=np.linalg.norm(base['knees'][i]-base['hips'][i])
+            lower=np.linalg.norm(base['ankles'][i]-base['knees'][i])
+            wave=math.sin(phase+math.pi*i)
+            ankle=base['ankles'][i].copy()
+            ankle[2]+=(.15+.08*speed)*movement*wave+.11*float(proxy.crouch_fraction())
+            ankle[1]+=(.065+.055*speed)*movement*max(0.,wave)
+            delta=ankle-hip;dist=np.linalg.norm(delta);axis=delta/max(dist,1e-8)
+            dist=min(dist,upper+lower-.002);ankle=hip+axis*dist
+            bend=np.array((0.,0.,1.));bend-=axis*np.dot(bend,axis)
+            bend/=max(np.linalg.norm(bend),1e-8)
+            along=(upper*upper-lower*lower+dist*dist)/(2*dist)
+            knee=hip+axis*along+bend*math.sqrt(max(0.,upper*upper-along*along))
+            k=9+i*3
+            palette[k]=_matrix(base['hips'][i],hip,base['knees'][i],knee)
+            palette[k+1]=_matrix(base['knees'][i],knee,base['ankles'][i],ankle)
+            # Foot stays forward/level instead of inheriting shin twist.
+            # Fitted shins were rotated offline, but source boots retained
+            # asymmetric bind yaw (~-29.6/+10.6 degrees in the XZ plane).
+            # Unwind this during locomotion; retain the accepted idle stance.
+            toe_yaw=(.43,-.10)[i]*min(1.,movement*2.)
+            palette[k+2]=_matrix(base['ankles'][i],ankle,twist=toe_yaw)
+        return palette
+
+    def _prepare_contacts(self):
+        """Small directional support set, shared by every actor; no full skin at death."""
+        if hasattr(self,'_contact_parts'):return
+        directions=np.array([(x,y,z) for x in (-1,0,1) for y in (-1,0,1)
+                             for z in (-1,0,1) if x or y or z],dtype=float)
+        parts=[]
+        for primitives in (self.asset.primitives[:-1],self.asset.primitives[-1:]):
+            v=np.concatenate([p.vertices for p in primitives])
+            owner=v[np.arange(len(v)),8+v[:,12:16].argmax(1)].astype(int)
+            indices=[]
+            for bone in np.unique(owner):
+                group=np.flatnonzero(owner==bone)
+                indices.extend(group[np.argmax(v[group,:3]@directions.T,axis=0)])
+            ids=np.unique(indices);parts.append((v[ids],owner[ids]))
+        self._contact_parts=parts
+
+    @staticmethod
+    def _skin_contact(vertices,palette):
+        h=np.column_stack((vertices[:,:3],np.ones(len(vertices))));q=np.zeros_like(h)
+        for k in range(4):
+            q+=np.einsum('nij,nj->ni',palette[vertices[:,8+k].astype(int)],h)*vertices[:,12+k,None]
+        return q[:,:3]
+
+    def _ground_plane(self,actor,model):
+        """Cached local approximation of the existing world floor, render-only."""
+        sample=getattr(self,'ground_height',None)
+        if sample is None:return np.array((0.,0.,0.))
+        offsets=np.array(((0.,0.),(-.45,0.),(.45,0.),(0.,-1.),(0.,1.)))
+        heights=[]
+        for x,z in offsets:
+            w=model@np.array((x,0.,z,1.))
+            heights.append(sample(actor,float(w[0]),float(w[2]))-model[1,3])
+        design=np.column_stack((np.ones(len(offsets)),offsets))
+        plane=np.linalg.lstsq(design,np.array(heights),rcond=None)[0]
+        # A support plane sits above sampled small ruts, not below their peaks.
+        plane[0]+=max(0.,float(np.max(np.array(heights)-design@plane)))
+        return plane
+
+    def _posed_points(self,palette,parts):
+        points=[]
+        for p in parts:
+            v=p.vertices;h=np.column_stack((v[:,:3],np.ones(len(v))));q=np.zeros_like(h)
+            for k in range(4):
+                q+=np.einsum('nij,nj->ni',palette[v[:,8+k].astype(int)],h)*v[:,12+k,None]
+            points.append(q[:,:3])
+        return np.concatenate(points)
+
+    def collect_instances(self,agents,position_at,heading_at):
+        from copy import copy
+        from rig_renderer import SkeletalEnemyRenderer
+        from enemy_system import actor_facing
+        if not hasattr(self,'_alive_palette'):self._alive_palette={};self._fallen={}
+        ids={a.spec.enemy_id for a in agents}
+        for cache in (self._alive_palette,self._fallen):
+            for key in list(cache):
+                if key not in ids:cache.pop(key,None)
+        result=[]
+        for actor in agents:
+            uid=actor.spec.enemy_id;override=getattr(actor,'pose_preview',None)
+            dead=actor.dead or override=='dead'
+            model=SkeletalEnemyRenderer._model_matrix(position_at(actor.spec),
+                actor_facing(actor,heading_at(actor.route_m)))
+            if not dead:
+                self._fallen.pop(uid,None)
+                palette=self.living_palette(actor,override)
+                self._alive_palette[uid]=palette.copy()
+            else:
+                if uid not in self._fallen:
+                    self._prepare_contacts()
+                    frozen=self._alive_palette.get(uid)
+                    if frozen is None:
+                        proxy=copy(actor);proxy.dead=False;proxy.state='idle'
+                        frozen=self.living_palette(proxy,'stand')
+                    frozen=frozen.copy()
+                    body=self._skin_contact(self._contact_parts[0][0],frozen)
+                    gun=self._skin_contact(self._contact_parts[1][0],frozen)
+                    owners=self._contact_parts[0][1]
+                    # Land on the back, not on outstretched weapon hands.
+                    # Align posterior pelvis/torso supports to avoid a hovering chest.
+                    hip=body[owners==0];chest=body[owners==1]
+                    h=hip[np.argmin(hip[:,2])];c=chest[np.argmin(chest[:,2])]
+                    settle=float(np.clip(math.atan2(h[2]-c[2],max(.1,c[1]-h[1])),-.18,.18))
+                    plane=self._ground_plane(actor,model)
+                    self._fallen[uid]=(frozen,body,gun,settle,plane,model.copy())
+                frozen,body,gun,settle,plane,death_model=self._fallen[uid]
+                t=min(1.,max(0.,actor.state_time/1.35)) if actor.dead else 1.
+                f=t*t*(3.-2.*t);angle=(-math.pi*.5+settle)*f;c,s=math.cos(angle),math.sin(angle)
+                fall=np.eye(4,dtype='f4');fall[:3,:3]=((1.,0.,0.),(0.,c,-s),(0.,s,c))
+                from skeletal_pose import _orientation
+                normal=np.array((-plane[1]*f,1.,-plane[2]*f))
+                align=_orientation((np.zeros(3),np.zeros(3)),(np.array((0.,1.,0.)),normal))
+                fall[:3,:3]=align@fall[:3,:3]
+                support=body@fall[:3,:3].T
+                floor=plane[0]+plane[1]*support[:,0]+plane[2]*support[:,2]
+                fall[1,3]=.008+float(np.max(floor-support[:,1]))
+                palette=fall[None,:,:]@frozen
+                # Release the rifle during the fall. The frozen living grip
+                # otherwise rotates its forward barrel vertically with the torso.
+                # Body palette/contact stay untouched; only visual weapon bone 15.
+                release=max(0.,min(1.,(t-.12)/.78))
+                release=release*release*(3.-2.*release)
+                turn=(math.pi*.5-settle)*release
+                cc,ss=math.cos(turn),math.sin(turn)
+                unfall=np.array(((1.,0.,0.),(0.,cc,-ss),(0.,ss,cc)))
+                center=gun.mean(axis=0)
+                gp0=fall[:3,:3]@center+fall[:3,3]
+                rotation=fall[:3,:3]@unfall
+                # A released rifle rests on its side, not upright on magazine
+                # and grip. Stable per-actor yaw/roll; no gameplay RNG consumed.
+                variation=(int(uid)^0xB5297A4D)&0xffffffff
+                variation=((variation^(variation>>16))*0x7FEB352D)&0xffffffff
+                variation=((variation^(variation>>15))*0x846CA68B)&0xffffffff
+                variant=(variation^(variation>>16))/4294967296.
+                yaw=(variant-.5)*.40*release
+                roll=(math.pi*.5+(.5-variant)*.16)*release
+                cy,sy=math.cos(yaw),math.sin(yaw)
+                cr,sr=math.cos(roll),math.sin(roll)
+                rotation=rotation@np.array(((cy,0.,sy),(0.,1.,0.),(-sy,0.,cy)))
+                rotation=rotation@np.array(((cr,-sr,0.),(sr,cr,0.),(0.,0.,1.)))
+                destination=gp0*(1.-release)+np.array((.57,plane[0]+.12,-.65))*release
+                palette[15,:3,:3]=rotation@frozen[15,:3,:3]
+                palette[15,:3,3]=destination+rotation@(frozen[15,:3,3]-center)
+                gp=(gun-center)@rotation.T+destination
+                gap=gp[:,1]-(plane[0]+plane[1]*gp[:,0]+plane[2]*gp[:,2])
+                clearance=.008-float(np.min(gap))
+                palette[15,1,3]+=max(0.,clearance)+min(0.,clearance)*release
+                # Exterior idle gaze may keep changing after death. Freeze only
+                # the rendered body in world space, never the gameplay actor.
+                correction=np.eye(4,dtype='f4')
+                correction[:3,:3]=model[:3,:3].T@death_model[:3,:3]
+                correction[:3,3]=model[:3,:3].T@(death_model[:3,3]-model[:3,3])
+                palette=correction[None,:,:]@palette
+            result.append((model,palette,actor))
+        return result

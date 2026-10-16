@@ -85,7 +85,8 @@ class ProcessStreamingTests(unittest.TestCase):
         class FakePool:
             def __init__(self,*args,**kw):
                 self.args=kw
-            def submit(self,fn,route):
+            def submit(self,fn,route,seed):
+                assert seed==game.SEED
                 self.fn=fn
                 self.route=route
                 self.assert_valid()
@@ -99,7 +100,7 @@ class ProcessStreamingTests(unittest.TestCase):
         self.assertEqual(len(results),1)
         gen,idx,(verts,shot)=results[0]
         self.assertEqual((gen,idx),(0,3))
-        self.assertIsInstance(shot,WorldShotMesh)
+        self.assertIsInstance(shot,game.WorldShotMesh)
         self.assertEqual(t.worker_current_chunk,None)
         self.assertGreaterEqual(t.worker_last_ms,0.)
 

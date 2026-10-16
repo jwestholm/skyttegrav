@@ -40,14 +40,37 @@ class EnemySpec:
     branch_depth: float = 0.0
     exterior_side: int = 0
     exterior_clearance: float = 1.15
+    initial_gaze_phase: float = 0.0
+    visual_variant: int | None = None
 
 
-def encounter_spec(index):
+def encounter_unit(seed,index,salt=0):
+    """Independent encounter stream; stable across processes and chunk order."""
+    v=(int(seed)^0xC8013EA4^(int(index)*0x9E3779B9)^(salt*0x85EBCA6B))&0xffffffff
+    v=((v^(v>>16))*0x7FEB352D)&0xffffffff
+    v=((v^(v>>15))*0x846CA68B)&0xffffffff
+    return (v^(v>>16))/4294967296.
+
+
+def encounter_spec(index,seed=None):
     """Stable, bounded lookups; no million-enemy registry or RNG state."""
     if index < 0:
         raise ValueError('encounter index must be non-negative')
-    # Known four encounter positions remain at the same route metres.
-    # Physical flank placement replaces the nearly centered spawn lanes.
+    # Explicit world seed drives gameplay; no-seed calls preserve older
+    # authored scenery/cover anchors and legacy fixtures.
+    if seed is not None:
+        # Bounded random intervals, analytically indexed: no growing plan cache.
+        # The no-seed path below remains available for legacy scenery anchors.
+        if index<4:base,jitter=34.+52.*index,7.
+        elif index<9:base,jitter=238.+44.*(index-4),6.
+        else:base,jitter=470.+34.*(index-9),5.
+        s=base+(encounter_unit(seed,index)*2.-1.)*jitter
+        lateral=(.30+.28*encounter_unit(seed,index,1))*(1 if encounter_unit(seed,index,2)>.5 else -1)
+        kinds=('unaware',) if s<100 else ('unaware','ambush','cover')
+        kind=kinds[min(len(kinds)-1,int(encounter_unit(seed,index,3)*len(kinds)))]
+        return EnemySpec(index,s,lateral,kind,
+                         initial_gaze_phase=encounter_unit(seed,index,4)*math.tau,
+                         visual_variant=int(encounter_unit(seed,index,5)*3))
     first = (
         (32.0, -.43, 'unaware'),
         (164.0, .51, 'ambush'),
@@ -75,18 +98,23 @@ PAIR_FIRST = 4
 PAIR_PERIOD = 5
 
 
-def encounter_partner_spec(primary_index):
-    """Seed-stable companion beside selected post-tutorial encounters.
+def encounter_partner_spec(primary_index,seed=None):
+    """Seed-stable companion beside selected encounters, capped by distance.
 
-    Never alter the four physically tested early encounters. A companion is
+    The legacy no-seed path preserves old cover anchors. A companion is
     its own independently simulated, shot-frozen enemy with a distinct ID.
     """
-    if primary_index < PAIR_FIRST or (primary_index-PAIR_FIRST) % PAIR_PERIOD:
-        return None
-    lead=encounter_spec(primary_index)
+    lead=encounter_spec(primary_index,seed)
+    if seed is None:
+        if primary_index < PAIR_FIRST or (primary_index-PAIR_FIRST) % PAIR_PERIOD:return None
+    else:
+        chance=min(.55,max(0.,(lead.route_m-100.)/1100.))
+        if encounter_unit(seed,primary_index,6)>=chance:return None
     flank=-1 if lead.lateral>=0 else 1
     return EnemySpec(PAIR_ID_BASE+primary_index,lead.route_m+2.45,
-                     flank*.57,'cover' if primary_index%2 else 'ambush')
+                     flank*.57,'cover' if primary_index%2 else 'ambush',
+                     initial_gaze_phase=lead.initial_gaze_phase,
+                     visual_variant=lead.visual_variant)
 
 
 BRANCH_ENEMY_ID_BASE = 2000000000
@@ -109,7 +137,7 @@ def side_room_enemy_spec(index,side):
 EXTERIOR_PATROL_ID_BASE = 3000000000
 
 
-def exterior_patrol_spec(index):
+def exterior_patrol_spec(index,seed=None):
     """Sparse REAL above-bank patrols away from openings and tutorial combat.
 
     One lookout near the midpoint between 72m-spaced junctions every eight
@@ -117,7 +145,7 @@ def exterior_patrol_spec(index):
     """
     if index < 7 or index % 8 != 7:
         return None
-    route_m = encounter_spec(index).route_m
+    route_m = encounter_spec(index,seed).route_m
     side = 1 if (index // 8) % 2 else -1
     return EnemySpec(EXTERIOR_PATROL_ID_BASE + index,route_m,0.,'unaware',
                      exterior_side=side,exterior_clearance=1.30)
@@ -562,19 +590,63 @@ class EnemyDirector:
     There is no autonomous kill or expiry. Once a threat engages, it holds the
     soldier until a validated Game Space hit eliminates the agent.
     """
-    def __init__(self):
+    def __init__(self,world_seed=None):
+        self.world_seed=world_seed
         self.active={}
         self.eliminated=set()
         self.contact_count=0
         self.last_hit=None
         self.gunshots_this_frame=()
+        self.manual_presentation=False
+        self.manual_waiting={}
+        self.manual_target=None
 
     def reset(self):
         self.active.clear()
+        self.manual_waiting.clear()
+        self.manual_target=None
         self.eliminated.clear()
         self.contact_count=0
         self.last_hit=None
         self.gunshots_this_frame=()
+
+    def set_manual_presentation(self,enabled,route_m,preferred=()):
+        """Admission gate only: the encounter plan and actor FSM are unchanged.
+
+        Deferred actors are absent from BOTH rendering and frozen hit regions.
+        Existing actor objects retain their state when toggling either way.
+        """
+        self.manual_presentation=bool(enabled)
+        if enabled:
+            self._present_one(route_m,preferred)
+        else:
+            self.active.update(self.manual_waiting)
+            self.manual_waiting.clear()
+            self.manual_target=None
+
+    def _present_one(self,route_m,preferred=()):
+        if not self.manual_presentation:return
+        candidates=dict(self.manual_waiting)
+        candidates.update({i:a for i,a in self.active.items() if not a.dead})
+        # Same spatial lifetime as normal actors. Eviction never eliminates an
+        # ID: its seed-defined encounter remains available on returning here.
+        candidates={i:a for i,a in candidates.items() if not a.dead
+                    and i not in self.eliminated and route_m-85<=a.route_m<=route_m+100}
+        target=self.manual_target
+        # Do not let an already passed/hidden side patrol monopolise the
+        # presentation while playable main-route encounters wait ahead.
+        ahead=[i for i,a in candidates.items() if a.route_m>=route_m-3 and not off_trunk(a.spec)]
+        if target in candidates and ahead and (candidates[target].route_m<route_m-3 or off_trunk(candidates[target].spec)):
+            target=None
+        if target not in candidates:
+            preferred=set(preferred)
+            target=min(candidates,key=lambda i:(i not in preferred,off_trunk(candidates[i].spec),
+                candidates[i].route_m<route_m-3,
+                abs(candidates[i].route_m-route_m),i)) if candidates else None
+        self.active={i:a for i,a in self.active.items() if a.dead}
+        if target is not None:self.active[target]=candidates.pop(target)
+        self.manual_waiting=candidates
+        self.manual_target=target
 
     def react_to_player_fire(self,route_m,cover_candidates=None,fallen_enemy_id=None):
         """Bounded player-shot stimulus to nearby ALREADY alerted combatants.
@@ -619,17 +691,23 @@ class EnemyDirector:
         return tuple(alerted)
 
     def update(self,dt,route_m,can_see_player=None,branch_side_at=None):
-        # First four remain fixed; later patrols are a denser but bounded 72m
-        # grid. Never allocate enemies across the infinite level in advance.
+        # Legacy no-seed fixtures use the old 72m grid. Seeded gameplay uses
+        # the bounded progression window below; never allocate an infinite plan.
         first=max(4,4+int(math.floor((route_m-105.-516.)/72.)))
         last=max(first+1,4+int(math.ceil((route_m+105.-516.)/72.)))
         primary_indices=list(range(4))+list(range(first,last+1))
+        seed=self.world_seed
+        if seed is not None:
+            # At most a small fixed window, even millions of metres in.
+            first=max(9,9+int(math.floor((route_m-110.-470.)/34.)))
+            last=max(first,9+int(math.ceil((route_m+110.-470.)/34.)))
+            primary_indices=list(range(9))+list(range(first,last+1))
         # Companions are generated by the same bounded active window, not an
         # infinite global registry. Their IDs and positions are deterministic.
         specs=[]
         for idx in primary_indices:
-            specs.append(encounter_spec(idx))
-            partner=encounter_partner_spec(idx)
+            specs.append(encounter_spec(idx,seed))
+            partner=encounter_partner_spec(idx,seed)
             if partner is not None:
                 specs.append(partner)
         # Sparse stationary sentries in REAL side rooms. The game supplies
@@ -645,15 +723,19 @@ class EnemyDirector:
         # independent actors. They NEVER become blocking main-route threats.
         ext_first=max(7,int(math.floor((route_m-100.-516.)/72.))+4)
         ext_last=max(ext_first,int(math.ceil((route_m+100.-516.)/72.))+4)
-        for i in range(ext_first,ext_last+1):
+        for i in (range(ext_first,ext_last+1) if seed is None else primary_indices):
             if i%8==7:
-                specs.append(exterior_patrol_spec(i))
+                specs.append(exterior_patrol_spec(i,seed))
         for spec in specs:
             if spec is None:continue
             idx=spec.enemy_id
             if idx in self.eliminated:continue
             if abs(spec.route_m-route_m)<=90.0:
-                self.active.setdefault(idx,EnemyAgent(spec))
+                if self.manual_presentation:
+                    if idx not in self.active and idx not in self.manual_waiting:
+                        self.manual_waiting[idx]=EnemyAgent(spec)
+                else:self.active.setdefault(idx,EnemyAgent(spec))
+        self._present_one(route_m)
         gunshots=[]
         shot_ids=[]
         self.gunshots_this_frame=()
@@ -1048,7 +1130,7 @@ def actor_facing(agent,heading):
         # before visual contact; never instant omniscience or idle blindness.
         if agent.heard_shots:
             return heading+math.pi*.94
-        fraction=.70+.67*math.sin(agent.total_time*.67+agent.spec.enemy_id*.43)
+        fraction=.70+.67*math.sin(agent.total_time*.67+agent.spec.enemy_id*.43+agent.spec.initial_gaze_phase)
         return heading+math.pi*fraction
     if agent.state in ('scanning','peeking','hiding','locating'):
         sweep=.79*math.sin(agent.total_time*(1.65+agent.tactical_difficulty.level*.18)

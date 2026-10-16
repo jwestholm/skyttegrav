@@ -5,7 +5,7 @@ Run: python3 trench_3d_test.py
 from __future__ import annotations
 
 import math
-from collections import OrderedDict
+from collections import OrderedDict, deque
 import queue
 import threading
 import os
@@ -26,7 +26,7 @@ from combat_tactics import difficulty_at, MATERIALS, tactical_cover_lane
 from death_screen import DeathScreen
 from shadow_lighting import ShadowRenderer, SHADOW_GLSL
 from rig_renderer import SkeletalEnemyRenderer
-from gltf_actor import GLBSkinnedRenderer
+from gltf_actor import GLBSkinnedRenderer, TacticalEnemyRenderer
 from skeletal_pose import POSE_LAB, PoseTransition
 from shot_geometry import WorldShotMesh, trace_world, cover_name
 from battlefield_events import BattlefieldEventDirector, BattlefieldEffectRenderer, blast_reaction_level
@@ -52,7 +52,9 @@ FOG_DENSITY = 1.0  # Atmospheric haze; close-range aiming remains unobstructed.
 # Initial lift from desktop/window-manager placement; F9/F10 move in 12px steps.
 WINDOW_RAISE_PIXELS = 28
 OBSTACLE_SPACING = 13.0  # sparse, legible traversals without cluttering blind corners
-SEED = 1944
+DEFAULT_SEED = 1944
+SEED = DEFAULT_SEED
+WORLD_BUILD_LOCK = threading.RLock()
 SEGMENT = 1.0
 CHUNK_LEN = 80.0
 JUNCTION_FIRST = 64
@@ -146,8 +148,42 @@ float terrain_pattern(vec3 p) {
          + 0.23*sin(p.x*4.12+p.y*3.17-p.z*2.92)
          + 0.11*cos(p.z*7.08+p.y*5.91);
 }
+bool linear_surface() {
+    return v_layer==20 || v_layer==21 || v_layer==8 ||
+           v_layer==13 || v_layer==14 || v_layer==15 || v_layer==16 || v_layer==18;
+}
 vec3 sample_color(vec2 uv,int layer) {
-    return texture(materials,vec3(uv,float(layer))).rgb;
+    // This photographed board sheet has horizontal grain; the other sheets
+    // and all metric plank UVs use V along the timber.
+    if(layer==15)uv=uv.yx;
+    vec3 c=texture(materials,vec3(uv,float(layer))).rgb;
+    // Albedo is sRGB; normal data stays linear. Preserve unrelated actor/VFX grading.
+    return linear_surface() ? pow(c,vec3(2.2)) : c;
+}
+vec3 detail_normal(vec3 base,vec2 uv,int layer,float strength) {
+    if(layer==15)uv=uv.yx;
+    vec3 dp1=dFdx(v_world),dp2=dFdy(v_world);
+    vec2 a=dFdx(uv),b=dFdy(uv);
+    float determinant=a.x*b.y-a.y*b.x;
+    if(abs(determinant)<1e-9 || use_pbr_normals==0)return base;
+    vec3 t=(dp1*b.y-dp2*a.y)/determinant;
+    vec3 bt=(-dp1*b.x+dp2*a.x)/determinant;
+    t-=base*dot(base,t);bt-=base*dot(base,bt);
+    if(min(dot(t,t),dot(bt,bt))<1e-10)return base;
+    // Both axes come from the UV derivatives, not screen winding. This also
+    // handles mirrored banks and the underside of the tunnel correctly.
+    vec3 nm=texture(material_normals,vec3(uv,float(layer))).xyz*2.0-1.0;
+    return normalize(normalize(t)*nm.x*strength+normalize(bt)*nm.y*strength+base*max(.1,nm.z));
+}
+void soil_texture(vec3 base,int layer,out vec3 color,out vec3 normal) {
+    // Shared metre-scale projection across walls, floors, roof and chunk seams.
+    // Avoid stretched vertical UVs and keep photographed detail in all orientations.
+    vec3 w=pow(abs(base),vec3(4.));w/=max(.0001,w.x+w.y+w.z);
+    vec2 ux=v_world.zy*.80,uy=v_world.xz*.80,uz=v_world.xy*.80;
+    color=sample_color(ux,layer)*w.x+sample_color(uy,layer)*w.y+sample_color(uz,layer)*w.z;
+    normal=normalize(detail_normal(base,ux,layer,.48)*w.x+
+                     detail_normal(base,uy,layer,.48)*w.y+
+                     detail_normal(base,uz,layer,.48)*w.z);
 }
 // V3.9.2 real depth shadow maps; shared by world and actors.
 ''' + SHADOW_GLSL + '''
@@ -155,24 +191,14 @@ void main(){
     vec3 n=normalize(v_normal);
     vec3 col;
     vec2 uv=v_uv;
-    if (v_layer == 20) {
-        // Organic deposits measured in world space, NEVER 4 flat material bands.
-        // Smooth weights remain continuous at every chunk boundary and mesh edge.
-        float organic=terrain_pattern(v_world);
-        float rock=smoothstep(-.13,.49,organic + .13*sin(v_world.y*1.71+v_world.x*.93));
-        float clay=smoothstep(.06,.69,-organic + .17*cos(v_world.z*.71+v_world.y*2.16));
-        float humus=smoothstep(.23,.79,terrain_pattern(v_world*.63+vec3(3.2,1.7,0.7)));
-        col=mix(sample_color(uv,0),sample_color(uv*.87,1),rock*.68);
-        col=mix(col,sample_color(uv*1.17,2),clay*.60);
-        col=mix(col,sample_color(uv*.72,3),humus*.25);
-    } else if (v_layer == 21) {
-        // Real floor variation: damp mud, fine gravel and darker footprint zones.
-        float n1=terrain_pattern(v_world*vec3(.64,1.0,.64));
-        float n2=terrain_pattern(v_world*vec3(1.74,1.0,1.74)+vec3(6.,0.,2.));
-        float pebbles=smoothstep(-.10,.48,n1+n2*.30);
-        float wet=smoothstep(.13,.60,-n1+n2*.35);
-        col=mix(sample_color(uv,4),sample_color(uv*.84,1),pebbles*.58);
-        col=mix(col,sample_color(uv*1.13,12),wet*.41);
+    if (v_layer == 20 || v_layer == 21) {
+        vec3 soil,soil_n,inclusions,inclusions_n;
+        soil_texture(n,0,soil,soil_n);
+        soil_texture(n,v_layer==21 ? 4 : 1,inclusions,inclusions_n);
+        float deposits=smoothstep(-.35,.45,terrain_pattern(v_world*.37));
+        float blend=(v_layer==21 ? .32 : .22)*deposits;
+        col=mix(soil,inclusions,blend);
+        n=normalize(mix(soil_n,inclusions_n,blend));
     } else if (v_layer==26) {
         // Dedicated hanging cloth material; 26 is a shader-only material ID.
         // Canvas and dirty bag-fabric blend without new texture dependencies.
@@ -194,12 +220,21 @@ void main(){
     if (v_layer==20 || v_layer==21 || v_layer==22 || v_layer==3) {
         float grit=terrain_pattern(v_world*vec3(3.6,4.1,3.6)+vec3(4.,2.,7.));
         float deposits=smoothstep(.13,.54,terrain_pattern(v_world*.61));
-        col *= .90 + .13*grit + .09*deposits;
+        col *= .96 + .025*grit + .025*deposits;
         if (v_layer==20) {
             // Light clay seams follow the excavated surface; irregular strata
             // break up the otherwise evenly-grey wall shading.
             float strata=sin(v_world.y*9.4 + sin(v_world.x*1.73+v_world.z*.87)*1.9);
-            col *= 1.0 - .095*smoothstep(.58,.91,strata)*deposits;
+            col *= 1.0 - .025*smoothstep(.58,.91,strata)*deposits;
+            // Rain streaks and wet seams follow gravity in world space. Keep
+            // ceiling/floor response separate; no change to geometry or IDs.
+            float vertical=1.0-smoothstep(.35,.82,abs(n.y));
+            float rivulet=sin(v_world.x*12.3+v_world.z*9.7
+                              +.32*sin(v_world.y*2.8+v_world.z));
+            float wet=smoothstep(.48,.91,rivulet)*deposits*vertical;
+            float seep=smoothstep(.06,.58,terrain_pattern(
+                       v_world*vec3(.8,.22,.8)+vec3(7.,1.,3.)))*vertical;
+            col*=mix(vec3(1.0),vec3(.66,.70,.64),clamp(wet*.25+seep*.22,0.0,.4));
         }
     } else if (v_layer==8 || (v_layer>=13 && v_layer<=18)) {
         // Variable timber dampness / soot on the shoring, never uniform beige.
@@ -213,21 +248,10 @@ void main(){
         col*=mix(vec3(.69,.75,.65),vec3(1.04,1.02,.91),
                  smoothstep(-.42,.43,canopy+.24*speck));
     }
-    // Surface-detail normals are used on actual PBR-covered materials, not on
-    // procedural IDs (where the albedo is a multi-material blend).
-    if (use_pbr_normals == 1 && v_layer >= 0) {
-        // Organic wall and floor blends reuse the leading photographed normal.
-        int normal_layer = v_layer == 20 ? 0 : (v_layer == 21 ? 4 : (v_layer == 22 ? 3 : (v_layer == 26 ? 19 : v_layer)));
-        vec3 tangent_norm=texture(material_normals,vec3(uv,float(normal_layer))).xyz*2.0-1.0;
-        vec3 dp1=dFdx(v_world),dp2=dFdy(v_world);
-        vec2 duv1=dFdx(uv),duv2=dFdy(uv);
-        float determinant=duv1.x*duv2.y-duv1.y*duv2.x;
-        if (abs(determinant)>0.000001) {
-            vec3 t=normalize((dp1*duv2.y-dp2*duv1.y)/determinant);
-            t=normalize(t-n*dot(n,t));
-            vec3 b=normalize(cross(n,t))*sign(determinant);
-            n=normalize(mat3(t,b,n)*vec3(tangent_norm.xy*.72,tangent_norm.z));
-        }
+    // The soil branch already blended matching color/normal channels.
+    if (v_layer!=20 && v_layer!=21) {
+        int layer=v_layer==22 ? 3 : (v_layer == 26 ? 19 : v_layer);
+        n=detail_normal(n,uv,layer,.48);
     }
     vec3 sun=normalize(sun_direction);
     vec3 moon=normalize(moon_direction);
@@ -239,7 +263,8 @@ void main(){
                                 v_world,max(.0006,.0020*(1.0-diffuse))) : 1.0;
     float moon_vis=(shadow_mode!=0) ? shadow_pcf(shadow_moon,shadow_moon_mvp,
                                  v_world,max(.0006,.0018*(1.0-moonlight))) : 1.0;
-    float brightness=.37 + .52*diffuse*sun_vis + .10*moonlight*moon_vis;
+    float ambient=linear_surface() ? .28 : .37;
+    float brightness=ambient + .52*diffuse*sun_vis + .10*moonlight*moon_vis;
     col*=brightness;
     for (int i=0; i<8; i++) {
         if(i>=lamp_count) break;
@@ -248,8 +273,11 @@ void main(){
         float nearLamp=pow(max(0.0,1.0-r2/42.25),2.0);
         float facing=max(dot(n,normalize(delta)),0.0);
         float lamp_vis=(shadow_mode!=0 && i==shadow_lamp_index) ?
-                       shadow_pcf(shadow_lamp,shadow_lamp_mvp,v_world,.0025) : 1.0;
-        col+=vec3(.31,.19,.075)*nearLamp*(.23+.77*facing)*lamp_vis;
+                       mix(1.0,shadow_pcf(shadow_lamp,shadow_lamp_mvp,v_world,.0025),
+                           shadow_lamp_weight) : 1.0;
+        vec3 lamp_color=vec3(.31,.19,.075);
+        if(linear_surface())lamp_color=pow(lamp_color,vec3(2.2));
+        col+=lamp_color*nearLamp*(.23+.77*facing)*lamp_vis;
     }
     if (v_layer==12) {
         vec3 towardEye=normalize(camera_position-v_world);
@@ -268,6 +296,7 @@ void main(){
         float wet_response=damp*.095*diffuse*sun_vis*spec;
         col+=vec3(.65,.63,.55)*wet_response;
     }
+    if(linear_surface())col=pow(max(col,vec3(0.0)),vec3(1.0/2.2));
     col=pow(max(col,vec3(0.0)),vec3(.96));
     if (v_layer==11) col=vec3(1.0,.54,.16)*1.8;
     if (v_layer==12) col=mix(col,vec3(.10,.07,.045),.4);
@@ -391,6 +420,24 @@ def turn_for_meter(s):
     Every bend is eased over several metres; exact integral is independent of
     frame rate and chunks. Paired turns prevent endless turning in one direction.
     """
+    if SEED != DEFAULT_SEED:
+        # A separate integer stream: adding dressing must never reroute a world.
+        # Bounded absolute headings preserve forward progress and avoid loops.
+        def unit(index):
+            v=(SEED ^ 0xA341316C ^ (index*0x9E3779B9)) & 0xffffffff
+            v=((v ^ (v>>16))*0x7FEB352D) & 0xffffffff
+            v=((v ^ (v>>15))*0x846CA68B) & 0xffffffff
+            return (v ^ (v>>16))/4294967296.
+        spacing=30.+8.*unit(-1)
+        first=9.+6.*unit(-2)
+        block=int((s-first)//spacing)
+        if block<0:return 0.
+        previous=0. if block==0 else (unit(block-1)*2.-1.)*.85
+        target=(unit(block)*2.-1.)*.85
+        duration=12.+6.*unit(block+1000003)
+        start=first+spacing*block
+        return (target-previous)*(eased((s-start)/duration)-eased((s-start-1)/duration))
+    # Compatibility path: default 1944 retains every original coordinate.
     block=int((s-11)//34)
     if block<0:return 0.0
     start=11+34*block
@@ -416,6 +463,16 @@ def turn_for_meter(s):
 
 # Cache integer-metre centreline positions. Each step rotates smoothly.
 _ROUTE=[(0.,0.,0.)]  # x,z,heading
+
+def set_world_seed(seed):
+    """Switch the existing generator and its integrated centreline atomically."""
+    global SEED
+    with WORLD_BUILD_LOCK:
+        seed=int(seed)
+        if seed!=SEED:
+            _ROUTE[:]=[(0.,0.,0.)]
+            SEED=seed
+
 
 def route(s):
     s=max(0.,float(s));i=int(s)
@@ -563,10 +620,13 @@ class MeshBuilder:
                 if norm<1e-5:normal=np.array((0.,1.,0.))
                 else:normal/=norm
                 self.vertices.extend((*pos,*normal,*tc,float(layer)))
-    def quad(self,a,b,c,d,layer,uv):
-        for p,q,r,st in ((a,b,c,(uv[0],uv[1],uv[2])),(a,c,d,(uv[0],uv[2],uv[3]))):
-            normal=vec_normal(p,q,r)
-            for pos,tc in zip((p,q,r),st):self.vertices.extend((*pos,*normal,*tc,float(layer)))
+    def quad(self,a,b,c,d,layer,uv,normals=None):
+        for ids in ((0,1,2),(0,2,3)):
+            points=(a,b,c,d)
+            normal=vec_normal(*(points[i] for i in ids)) if normals is None else None
+            for i in ids:
+                n=normal if normals is None else normals[i]
+                self.vertices.extend((*points[i],*n,*uv[i],float(layer)))
     def as_array(self):return np.asarray(self.vertices,dtype='f4').reshape(-1,9)
 
 
@@ -574,6 +634,31 @@ def vec_normal(a,b,c):
     v=np.cross(np.array(b)-a,np.array(c)-a)
     d=np.linalg.norm(v)
     return v/d if d>.00001 else np.array([0.,1.,0.])
+
+
+def surface_normal(pu0,pu1,pv0,pv1,toward):
+    """Differential shading normal; never modifies the rendered/shot positions."""
+    a=tuple(pu1[i]-pu0[i] for i in range(3))
+    b=tuple(pv1[i]-pv0[i] for i in range(3))
+    n=(a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0])
+    length=math.sqrt(sum(v*v for v in n))
+    if length<1e-10:return tuple(toward)
+    sign=1. if sum(n[i]*toward[i] for i in range(3))>=0 else -1.
+    return tuple(v*sign/length for v in n)
+
+
+def earth_surface_normal(s,y_or_lateral,side=0):
+    """Global derivative samples keep shared vertices identical across chunks."""
+    e=.04
+    if side==0:
+        def p(t,l):return world(t,l,floor_y(t,l))
+        l=y_or_lateral
+        return surface_normal(p(s-e,l),p(s+e,l),p(s,l-e),p(s,l+e),(0.,1.,0.))
+    y=y_or_lateral
+    def p(t,h):return world(t,side*wall_offset(t,side,h,wall_height(t,side)),h)
+    center=world(s,0.,y);edge=p(s,y)
+    toward=tuple(center[i]-edge[i] for i in range(3))
+    return surface_normal(p(s-e,y),p(s+e,y),p(s,y-e),p(s,y+e),toward)
 
 
 def landscape_type(s):
@@ -610,7 +695,12 @@ def wall_offset(s, side, y, height):
     # Gradually decrease texture displacement at the floor and lip: adjacent
     # floor and terrain meshes retain an overlapping watertight transition.
     ripple *= math.sin(math.pi*u)**.7
-    return max(.68,main+shape+ripple)
+    # Broad excavated scallops, only OUTWARD from the previous bank. Keep
+    # foot, lip and covered passages exact: no narrower walkable corridor.
+    exposed=1.-eased(tunnel_open(s)*4.)
+    scallop=(.10+.12*(.5+.5*math.sin(s*.48+side*1.7)))
+    scallop*=math.sin(math.pi*u)**2 * eased((y-.35)/.65)*exposed
+    return max(.68,main+shape+ripple)+scallop
 
 
 def surface_material(s, side, height_fraction):
@@ -720,7 +810,7 @@ def _branch_footprint(i, side, cx, cz, right, forward, near, along, margin=.06):
     return (edge(a,-1),edge(a,1),edge(b,1),edge(b,-1))
 
 
-def _main_route_footprint(a,b,margin=-.15):
+def _main_route_footprint(a,b,margin=.06):
     """A navigable cross-section, projected in world X/Z, not route offsets."""
     def point(s,side):
         y=wall_height(s,side)
@@ -1863,9 +1953,21 @@ def local_box(mesh, s, lateral, y, length, width, height, material):
     # quad on each side; prevents flat timber silhouettes
     p=[pt(-a,-b,0),pt(a,-b,0),pt(a,b,0),pt(-a,b,0),
        pt(-a,-b,h),pt(a,-b,h),pt(a,b,h),pt(-a,b,h)]
-    uv=((0,0),(length,0),(length,width),(0,width))
-    for ia,ib,ic,id in ((0,1,2,3),(4,7,6,5),(0,4,5,1),(1,5,6,2),(2,6,7,3),(3,7,4,0)):
-        mesh.quad(p[ia],p[ib],p[ic],p[id],material,uv)
+    wood=material in (8,13,14,15,16,18)
+    # Local coordinates: identify long grain and a stable cross-grain direction.
+    local=((-a,-b,0),(a,-b,0),(a,b,0),(-a,b,0),
+           (-a,-b,h),(a,-b,h),(a,b,h),(-a,b,h))
+    grain=max(range(3),key=lambda i:(length,width,height)[i])
+    for ids in ((0,1,2,3),(4,7,6,5),(0,4,5,1),(1,5,6,2),(2,6,7,3),(3,7,4,0)):
+        if wood:
+            spans=[max(local[i][j] for i in ids)-min(local[i][j] for i in ids) for j in range(3)]
+            along=grain if spans[grain]>.0001 else max(range(3),key=lambda j:spans[j])
+            across=max((j for j in range(3) if j!=along),key=lambda j:spans[j])
+            # Photographed plank sheets cover ~1.6m across and ~2.4m along grain.
+            uv=tuple((local[i][across]/1.6+s*.137,local[i][along]/2.4) for i in ids)
+        else:
+            uv=((0,0),(length,0),(length,width),(0,width))
+        mesh.quad(*(p[i] for i in ids),material,uv)
 
 
 def beam_world(mesh, a, b, thickness=.10, material=8):
@@ -1977,6 +2079,14 @@ def dugout_furnishings(mesh,index,side,outer):
             a=spot(along-.27,side_offset+.42,floor_level+.025)
             b=spot(along+.24,side_offset+.31,floor_level+.037)
             beam_world(mesh,a,b,.023,15 if patch_id==0 else 18)
+    if outer>5.5:
+        section=2.5
+        flank=-1 if noise(index,19501)<.5 else 1
+        edge=flank*(min(branch_half_width(index,section+d) for d in (-.5,0,.5))-.18)
+        if abs(edge)-.14>.68:
+            def repair_spot(x,z,y):
+                return spot(section+x,edge+z,floor_level+y-.006)
+            fieldwork_prop(mesh,repair_spot,{'bunk':3,'supply':0,'aid':1,'signal':2}[dugout_style(index)],index+70000)
     for section in (3.4,5.6,7.4):
         if section>outer-2.1:continue
         flank=(-1 if rng.random()<.5 else 1)
@@ -2055,12 +2165,24 @@ def dugout_furnishings(mesh,index,side,outer):
     # Large worn cover / supply crates are deliberately behind inspection stop.
     # Further back => available as *visual* future enemy cover.
     cover_along=outer-1.15
-    center=spot(cover_along,.08,.52)
-    box(mesh,center,(1.08,1.06,.73),16)
-    for y in (.22,.47,.76):
-        box(mesh,spot(cover_along,.08,y),(.075,.028,.76),18)
-    for dx in (-.45,.45):
-        box(mesh,spot(cover_along+dx,.08,.55),(.055,.99,.08),13)
+    # Substitute the existing rear cover pile, beyond the inspection stop;
+    # never add an appliance to the playable passage or a room entrance.
+    if index==0 or (index>2 and noise(index,82931)<.025):
+        def appliance(x,z,y):return spot(cover_along+x,-.22+z,floor_level+y)
+        fieldwork_prop(mesh,appliance,9,index)
+        def stores(x,z,y):return spot(cover_along+x,.51+z,floor_level+y)
+        fieldwork_prop(mesh,stores,8,index)
+        def refuse(x,z,y):return spot(cover_along-.95+x,-.70+z,floor_level+y)
+        fieldwork_prop(mesh,refuse,5,index+809)
+        def meal(x,z,y):return spot(cover_along-.80+x,.67+z,floor_level+y)
+        fieldwork_prop(mesh,meal,6,index+910)
+    else:
+        center=spot(cover_along,.08,.52)
+        box(mesh,center,(1.08,1.06,.73),16)
+        for y in (.22,.47,.76):
+            box(mesh,spot(cover_along,.08,y),(.075,.028,.76),18)
+        for dx in (-.45,.45):
+            box(mesh,spot(cover_along+dx,.08,.55),(.055,.99,.08),13)
     # Battered hanging rags / equipment on the wall; offset remains near bank.
     if outer>10.5:
         # Formerly a beige, floating oval: an actual scrap of hanging canvas.
@@ -2143,7 +2265,8 @@ def environment_chunk(mesh,start):
         # gaps and different widths. Avoid identical railway sleepers.
         if tunnel_drop(s)>-.10 and theme in ('fortified','ruined','marsh','forest') and k%3==0:
             patch=int(s//21.)
-            if noise(patch,2100)>.24:
+            lining,_=lining_section(s)
+            if noise(patch,2100)>(.24 if lining==0 else .48 if lining==1 else .78):
                 across=min(.85, min(wall_width(s,-1),wall_width(s,1))-.18)
                 count=3 if noise(patch,2101)<.48 else 4
                 for lane in range(count):
@@ -2161,62 +2284,8 @@ def environment_chunk(mesh,start):
                       rng.uniform(.42,.98),.012,12)
         if theme in ('fortified','ruined','forest') and k%3==0:
             for side in (-1,1):
-                w=wall_width(s,side)
-                h=wall_height(s,side)
-                # supports only on semi-reinforced sections; posts perpendicular to floor
-                if rng.random()<(.9 if theme=='fortified' else .58):
-                    b=world(s,side*(wall_offset(s,side,0,h)-.09),floor_y(s,0.)-.025)
-                    t=world(s,side*(wall_offset(s,side,min(h-.13,2.1),h)-.09),min(h-.13,2.1))
-                    beam_world(mesh,b,t,.082 if theme!='ruined' else .072, 13 if noise(k+side,801)<.4 else 14)
-        # Revetments are substantial, irregular sections of actual timber,
-        # not evenly repeated corridor rails. Follow each bank's current width.
-        if theme in ('fortified','ruined','forest') and k%4==0:
-            for side in (-1,1):
-                zone=int((s+side*3.0)//15.0)
-                style=noise(zone, 900+side)
-                if theme=='forest' and noise(zone,914+side)>.78: continue
-                if style<.16:  # sometimes raw earth, not a corridor of endless rails
-                    continue
-                if style<.72:  # tight split-log shoring alternating with open broken timber
-                    packed=style<.40
-                    tiers=9 if packed else 5
-                    for j in range(tiers):
-                        if not packed and noise(zone*17+j,850+side)<.16:continue
-                        jf=(j+.8)/(tiers+.8)
-                        # Each timber has independent endpoints, small gaps,
-                        # taper and diameter; vertical joints hide repetitions.
-                        sy=s-1.8+(.40*(noise(zone*31+j,2201)-.5))
-                        ey=s+1.8+(.58*(noise(zone*31+j,2202)-.5))
-                        hs=wall_height(sy,side);he=wall_height(ey,side)
-                        drift=(noise(zone*11+j,810)-.5)*.064
-                        ys=hs*(jf+drift);ye=he*(jf+drift)
-                        a=world(sy,side*(wall_offset(sy,side,ys,hs)-.10),ys)
-                        b=world(ey,side*(wall_offset(ey,side,ye,he)-.10),ye)
-                        tone=(13 if noise(zone+j,812)<.40 else
-                              14 if noise(zone+j,813)<.47 else
-                              8 if noise(zone+j,814)<.62 else 15)
-                        radius=(.072+.054*noise(zone*31+j,2203)) if packed else (.077+.035*noise(zone*31+j,2204))
-                        beam_world(mesh,a,b,radius,tone)
-                    if noise(zone,2210)>.30:
-                        joint_s=s+1.69 + .21*(noise(zone,2211)-.5)
-                        hh=wall_height(joint_s,side)
-                        post_top=min(hh-.10,2.25)
-                        off=side*(wall_offset(joint_s,side,post_top*.55,hh)-.20)
-                        beam_world(mesh,world(joint_s,off,floor_y(joint_s,0.)-.03),
-                                   world(joint_s,off,post_top),
-                                   .09+.018*noise(zone,2212),13 if noise(zone,2213)<.5 else 14)
-                else:  # weathered vertical plank shoring, with narrow irregular gaps
-                    for idx in range(5):
-                        ss=s-1.65+idx*.78+.14*(noise(zone*29+idx,2215)-.5)
-                        hs=wall_height(ss,side)
-                        ytop=min(2.30,hs-.12)*(.68+.31*noise(zone*23+idx,811))
-                        w=wall_offset(ss,side,ytop*.45,hs)-.14
-                        plank_width=.41+.26*noise(zone*33+idx,2216)
-                        # Some planks have a shorter second split layer.
-                        local_box(mesh,ss,side*w,floor_y(ss,0.),plank_width,.065,ytop,
-                                  (15,16,18,8)[int(noise(zone*33+idx,817)*4)])
-                        if noise(zone*37+idx,2217)>.67:
-                            local_box(mesh,ss+.035,side*(w-.045),ytop*.52,plank_width*.73,.04,ytop*.24,15)
+                rng.random()  # preserve downstream existing decoration RNG
+        # Posts, sills and lining are now one construction in wall_dressing_chunk.
         if tunnel_drop(s)>-.10 and theme in ('fortified','ruined') and k%23==11:
             side=1 if rng.random()<.5 else -1
             w=wall_width(s,side)
@@ -2259,86 +2328,425 @@ def environment_chunk(mesh,start):
                        drop=.48+.48*noise(i,6805))
     # Ruined-zone outposts are generated separately in battlefield_debris_chunk.
 
-def trench_detail_props(mesh, start):
-    """Bounded, seed-stable scene dressing close to bank, not artificial blockers.
+def fieldwork_prop(mesh, spot, family, seed):
+    """Five small repair/supply silhouettes in a .94 x .28m envelope.
 
-    Real traversal obstacles are STILL emitted by draw_trench_obstacles and read
-    by SoldierBrain. Everything here fits in a shallow wall-side visual strip.
-    The small variation library is a placeholder for future GLB asset instances.
+    spot maps local metres onto the existing floor/room frame. Solid faces use
+    real wood/metal layers and therefore participate in the existing shot mesh.
+    No per-item render objects, collision registration or global RNG state.
     """
-    first=max(0,int((start-10.0)//4.4)-1)
-    last=int((start+CHUNK_LEN-10.0)//4.4)+2
-    for index in range(first,last):
-        # Clumps and empty stretches read as abandoned working areas;
-        # not identical props on alternate sides every 6.7 metres.
-        s=10.0+index*4.4+(noise(index,1001)-.5)*2.7
+    rng=random.Random(SEED*917+seed*1051)
+    def plank(x,z,y,length,width,height,layer=18):
+        corners=[spot(x+dx,z+dz,y+dy) for dx,dz,dy in
+                 ((-length/2,-width/2,0),(length/2,-width/2,0),
+                  (length/2,width/2,0),(-length/2,width/2,0),
+                  (-length/2,-width/2,height),(length/2,-width/2,height),
+                  (length/2,width/2,height),(-length/2,width/2,height))]
+        for indices in ((0,4,5,1),(1,5,6,2),(2,6,7,3),
+                        (3,7,4,0),(4,7,6,5),(0,1,2,3)):
+            pts=[corners[k] for k in indices]
+            # Metre-scaled grain on each face, including thin end grain.
+            u=math.dist(pts[0],pts[1])*2
+            v=math.dist(pts[1],pts[2])*2
+            mesh.quad(*pts,layer,((0,0),(u,0),(u,v),(0,v)))
+    if family>=5:
+        first_vertex=len(mesh.vertices)
+        # Modern field supplies share the existing bounded prop frame and batch.
+        # All filled volumes retain solid material semantics (including bags).
+        def rounded_rings(rings, layer, phase=0.):
+            n=12
+            for row in range(len(rings)-1):
+                def point(j,k):
+                    y,rx,rz,shift=rings[k]
+                    a=math.tau*(j%n)/n
+                    crease=1.+.12*math.sin(a*5+phase+k*.7)
+                    return spot(shift+rx*math.cos(a)*crease,rz*math.sin(a)*crease,y)
+                for j in range(n):
+                    mesh.quad(point(j,row),point(j+1,row),point(j+1,row+1),point(j,row+1),
+                              layer,((j/n,row/3),((j+1)/n,row/3),((j+1)/n,(row+1)/3),(j/n,(row+1)/3)))
+        if family==5:  # flattened base, asymmetric shoulders, gathered plastic neck
+            h=.29+.16*(seed%2)+.035*rng.random()
+            rounded_rings(((0.,0.,0.,0.),(.012,.22,.10,0.),
+                           (h*.40,.23,.10,-.016),(h*.78,.18,.10,.025),
+                           (h,.026,.023,.055),(h+.025,.014,.012,.055)),24,seed)
+            plank(.055,0,h,.065,.025,.018,10)
+            rounded_rings(((h+.025,.012,.01,.055),(h+.075,.052,.025,.07),
+                           (h+.08,0.,0.,.07)),24,seed)
+        elif family==6:  # folded foil meal pouch, crushed carton, no invented labels
+            for j in range(3):
+                x=(j-1)*.26;z=rng.uniform(-.035,.035)
+                layer=9 if j!=1 else 10
+                for k in range(3):
+                    a=x-.10+k*.067;b=a+.067
+                    ya=.008+(.022 if k==1 else .004)
+                    yb=.008+(.022 if k+1==1 else .004)
+                    mesh.quad(spot(a,z-.085,ya),spot(b,z-.085,yb),
+                              spot(b,z+.085,yb+.012),spot(a,z+.085,ya+.012),layer,
+                              ((k/3,0),((k+1)/3,0),((k+1)/3,1),(k/3,1)))
+                plank(x,z-.08,.012,.20,.012,.014,10)
+            plank(.29,.015,.0,.18,.16,.075,9)
+            plank(.29,.015,.075,.18,.018,.013,24)
+        elif family==7:  # ribbed polymer transport case with metal catches
+            plank(0,0,0,.62,.25,.29,24)
+            plank(0,0,.29,.65,.27,.035,24)
+            for x in (-.25,-.08,.09,.25):
+                plank(x,-.12,.035,.025,.015,.22,10)
+            for x in (-.21,.21):plank(x,-.12,.24,.045,.014,.075,10)
+            bar(mesh,spot(-.085,-.12,.20),spot(.085,-.12,.20),.014,10,6)
+        elif family==8:  # squat jerrycan with a genuinely open carry handle
+            plank(0,0,0,.29,.21,.32,24)
+            plank(0,0,.32,.27,.20,.045,24)
+            for x in (-.10,.10):plank(x,0,.365,.035,.045,.07,24)
+            plank(0,0,.425,.23,.045,.027,24)
+            bar(mesh,spot(-.09,-.065,.36),spot(-.09,-.065,.39),.032,10,8)
+            for x in (-.08,.08):plank(x,-.112,.06,.018,.012,.22,10)
+        elif family==9:  # 60cm dryer: recessed drum, lint vent, fascia, no soap drawer
+            plank(0,0,.035,.60,.60,.78,10)
+            plank(0,0,.815,.62,.62,.035,10)
+            # Front faces toward negative local x. Annular door and recessed dark drum.
+            def ring(a,r,depth):return spot(-.306-depth,math.cos(a)*r,.43+math.sin(a)*r)
+            for j in range(24):
+                a=j*math.tau/24;b=(j+1)*math.tau/24
+                uv=((0,0),(1,0),(1,1),(0,1))
+                mesh.quad(ring(a,.225,.042),ring(b,.225,.042),ring(b,.177,.042),ring(a,.177,.042),10,uv)
+                mesh.quad(ring(a,.177,.042),ring(b,.177,.042),ring(b,.155,.006),ring(a,.155,.006),24,uv)
+                mesh.quad(ring(a,.155,.005),ring(b,.155,.005),spot(-.311,0,.43),spot(-.311,0,.43),24,uv)
+            plank(-.318,0,.70,.025,.56,.09,9)
+            bar(mesh,spot(-.34,.17,.746),spot(-.36,.17,.746),.033,10,12)
+            plank(-.339,-.10,.725,.013,.13,.036,24)
+            for j in range(7):plank(-.32,-.18+j*.057,.11,.025,.032,.065,24)
+            plank(-.365,-.19,.41,.035,.028,.10,10)
+            # Drum baffles distinguish a vented tumble dryer from a laundry washer.
+            for z in (-.07,.07):plank(-.322,z,.37,.018,.016,.11,10)
+            for x in (-.24,.24):
+                for z in (-.24,.24):plank(x,z,0,.055,.055,.035,24)
+        # One solid atlas layer: enamel, creased plastic, kraft and olive plastic.
+        # Inset each tile to avoid mip bleed. No change to old material IDs.
+        for i in range(first_vertex,len(mesh.vertices),9):
+            layer=int(mesh.vertices[i+8])
+            tile=(0 if layer==10 else 1 if family==5 else 3) if layer!=9 else 2
+            if layer in (9,24) or (family==9 and layer==10):
+                u,v=mesh.vertices[i+6:i+8]
+                mesh.vertices[i+6]=.02+(tile%2)*.5+min(1.,max(0.,u))*.46
+                mesh.vertices[i+7]=.52-(tile//2)*.5+min(1.,max(0.,v))*.46
+                mesh.vertices[i+8]=27.
+        return
+    if family==0:  # open slatted ammunition tray, actual hollow interior
+        length=.54+.12*rng.random()
+        for j in range(3):plank(0,(j-1)*.077,0,length,.071,.026,15)
+        for side in (-1,1):
+            for row in range(2):
+                plank(0,side*.115,.028+row*.087,length,.022,.074,18)
+            plank(side*(length/2-.012),0,.026,.024,.22,.18,16)
+            plank(side*length*.34,-.129,.04,.025,.012,.13,10)
+        # Loose lid resting diagonally across one end, leaving contents visible.
+        plank(-length*.29,0,.207,.11,.26,.022,16)
+    elif family==1:  # dented open pail, inner wall and rolled rim, no fake cap
+        n=10
+        def ring(j,up,inner=False):
+            angle=math.tau*(j%n)/n
+            r=(.092 if up==0 else .122)*(1-.12*math.sin(j*2.7+seed)**4)
+            if inner:r-=.009
+            return spot(math.cos(angle)*r,math.sin(angle)*r,.018+up)
+        for j in range(n):
+            k=(j+1)%n
+            uv=((j/n,0),(k/n,0),(k/n,.36),(j/n,.36))
+            mesh.quad(ring(j,0),ring(k,0),ring(k,.27),ring(j,.27),10,uv)
+            mesh.quad(ring(k,0,True),ring(j,0,True),ring(j,.27,True),ring(k,.27,True),10,uv)
+            mesh.quad(ring(j,.27),ring(k,.27),ring(k,.27,True),ring(j,.27,True),10,uv)
+            mesh.quad(spot(0,0,.018),ring(k,0),ring(j,0),spot(0,0,.018),10,uv)
+        for j in range(8):
+            t=j*math.pi/8;u=(j+1)*math.pi/8
+            bar(mesh,spot(.119*math.cos(t),0,.26+.14*math.sin(t)),
+                spot(.119*math.cos(u),0,.26+.14*math.sin(u)),.007,10,6)
+    elif family==2:  # field wire spool, wood cheeks with exposed winding
+        for y in (.012,.174):
+            bar(mesh,spot(0,0,y),spot(0,0,y+.018),.118,16,10)
+        bar(mesh,spot(0,0,.03),spot(0,0,.175),.066,13,8)
+        for row in range(6):
+            for j in range(10):
+                t=j*math.tau/10;u=(j+1)*math.tau/10
+                y=.043+row*.022
+                bar(mesh,spot(.080*math.cos(t),.080*math.sin(t),y),
+                    spot(.080*math.cos(u),.080*math.sin(u),y+.002),.009,10,6)
+    elif family==3:  # short broken duckboard repair, missing and split slats
+        for z in (-.085,.085):plank(0,z,0,.85,.035,.032,13)
+        for j in range(6):
+            if j==2:continue
+            width=.14 if j==3 else .25
+            plank((j-2.5)*.14,.025 if j==3 else 0,.032,
+                  .10+.015*rng.random(),width,.025,15 if j%2 else 16)
+        plank(.02,-.09,.057,.29,.028,.012,18)
+    else:  # paired repaired shoring feet with mismatched battens and iron nails
+        for x in (-.29,.29):
+            plank(x,.055,0,.072,.10,.43+.08*rng.random(),13)
+        for row in range(3):
+            plank(.015*(row-1),-.012,.09+row*.125,.77-.05*rng.random(),.043,.085,
+                  18 if row!=1 else 16)
+            for x in (-.29,.29):
+                bar(mesh,spot(x,-.037,.13+row*.125),
+                    spot(x,-.044,.13+row*.125),.009,10,6)
+
+
+def fieldwork_layout(start):
+    """Global anchor ownership; whole props leave a >=1.36m central lane."""
+    for index in range(max(0,int((start-9)//6.7)-1),int((start+CHUNK_LEN)/6.7)+1):
+        s=9.+index*6.7+(noise(index,1001)-.5)*3.2
         if not start<=s<start+CHUNK_LEN:continue
-        if near_junction(s,5.0) or tunnel_drop(s)<-.10:continue
+        if near_junction(s,6.) or obstacles_in_range(s-1.5,s+1.5):continue
+        if noise(index,1004)<.18:continue
         side=-1 if noise(index//3,1002)<.5 else 1
-        w=wall_width(s,side)
-        h=wall_height(s,side)
-        # Keep the object at wall edge. This is cosmetic dressing only.
-        edge=side*max(.65,w-.13)
-        rng=random.Random(SEED*917+index*1051)
-        choice=noise(index,1003)
-        if noise(index//4,2218)<.13:continue
-        if choice<.16:  # weathered ladder against trench wall
-            top=min(h-.1,1.8)
-            a=world(s-.32,edge-side*.08,.025)
-            b=world(s-.32,edge+side*.015,top)
-            c=world(s+.32,edge-side*.08,.025)
-            d=world(s+.32,edge+side*.015,top)
-            beam_world(mesh,a,b,.042,13)
-            beam_world(mesh,c,d,.042,14)
-            for i in range(1,max(2,int(top/.32))):
-                y=i*.32
-                lateral=edge-side*.08+side*.095*(y/top)
-                beam_world(mesh,world(s-.32,lateral,y),world(s+.32,lateral,y),.030,18)
-        elif choice<.34:  # abandoned kit and small ammunition case
-            wood_crate(mesh,s,edge-side*.09,-.04,.38,.28,.28,15)
-            local_box(mesh,s,edge-side*.09,.24,.36,.29,.024,18)
-            # simple dark metal clasps
-            local_box(mesh,s+.16,edge-side*.10,.09,.025,.22,.11,10)
-        elif choice<.52:  # fallen split boards and stones
-            for k in range(3):
-                ss=s+(k-1)*.24
-                p=world(ss-.3,edge-side*.045,.045)
-                q=world(ss+.35,edge-side*(.06+.06*k),.11+.035*k)
-                beam_world(mesh,p,q,.030,15 if k%2 else 16)
-            for k in range(2):
-                ss=s+(k-.5)*.24
-                stone_pos=world(ss,edge-side*.07,floor_y(ss,edge-side*.07))
-                rock_fragment(mesh,stone_pos,.12+.03*k,index*13+k,7,(1.0,.78,1.15))
-        elif choice<.69:  # rolled muddy tarp tucked against reinforcement
-            length=.7+.23*rng.random()
-            y=.47+.22*rng.random()
-            a=world(s-length*.5,edge,.02)
-            b=world(s+length*.5,edge,.02)
-            c=world(s+length*.49,edge-side*.02,y)
-            d=world(s-length*.48,edge-side*.02,y*.82)
-            mesh.quad(a,b,c,d,19,((0,0),(1.1,0),(1.1,.9),(0,.9)))
-            beam_world(mesh,world(s-length*.49,edge,y*.65),world(s+length*.49,edge,y*.65),.012,10)
-        elif choice<.83:  # battered small iron barrel / container
-            pos=world(s,edge-side*.1,.015)
-            top=(pos[0],pos[1]+.50,pos[2])
-            bar(mesh,pos,top,.16,10,14,.45)
-            for y in (.12,.38):
-                center=(pos[0],pos[1]+y,pos[2])
-                # bent bands approximate hoop, without expensive torus meshes
+        # Check the complete footprint at several heights against the actual
+        # bank, including its undercut. Narrow bends get no new decoration.
+        bank=min(wall_offset(ss,side,floor_y(ss,0)+dy,wall_height(ss,side))
+                 for ss in (s-.5,s-.25,s,s+.25,s+.5) for dy in (0.,.25,.55))
+        edge=bank-.17
+        if edge-.14<.68:continue
+        family=int(noise(index,1003)*5)
+        yield s,side*edge,family,index
+
+
+def modern_fieldwork_layout(start):
+    """Reuse safe anchors, checking the *whole* meal/refuse cluster footprint."""
+    for s,edge,old,index in fieldwork_layout(start):
+        selected=index in (2,3,4,5,27) if s<200 else index%13 in (2,3,4)
+        if not selected:continue
+        if near_junction(s+.35,6.6) or obstacles_in_range(s-.55,s+1.15):continue
+        side=1 if edge>0 else -1
+        bank=min(wall_offset(t,side,floor_y(t,0)+y,wall_height(t,side))
+                 for t in (s-.5,s,s+.5,s+1.15) for y in (0.,.3,.6))
+        family={2:5,3:8,4:5,5:7,27:5}.get(index,5+index%4)
+        lining=min(lining_bank(t,side) for t in (s-.5,s,s+.5,s+1.15))
+        # Include the existing diagonal braces, not only the soil envelope.
+        inset=.335 if family==7 else .315
+        edge=side*min(abs(edge),bank-.17,lining-inset)
+        if abs(edge)-.14<.68:continue
+        yield s,edge,family,index
+
+
+def trench_detail_props(mesh, start):
+    """Baked, grounded wall-edge repairs; also follows covered passage ramps."""
+    clusters={p[3]:p for p in modern_fieldwork_layout(start)}
+    for s,edge,family,index in fieldwork_layout(start):
+        if index in clusters:s,edge,family,index=clusters[index]
+        def spot(x,z,y):
+            return world(s+x,edge+z,floor_y(s+x,edge+z)+y-.006)
+        # Quiet stretches retain existing field repairs; activity clusters are
+        # globally anchored and repeat sparsely beyond the introductory 200m.
+        if index in clusters:
+            fieldwork_prop(mesh,spot,family,index)
+            def litter(x,z,y):return spot(x+.72,z,y)
+            fieldwork_prop(mesh,litter,6,index+19000)
+        else:
+            fieldwork_prop(mesh,spot,family,index)
+
+def lining_section(s):
+    """Render-only roughly 14–34m construction runs: dense, wattle, repair, sparse, earth, heavy.
+
+    Shared by wall lining and existing duckboards; never used by navigation.
+    Stable global metres, independent of chunk size and build order.
+    """
+    zone=max(0,int(s//24.))
+    def boundary(i):return i*24.+(noise(i,28112)-.5)*10. if i else 0.
+    if zone and s<boundary(zone):zone-=1
+    elif s>=boundary(zone+1):zone+=1
+    style=(zone+int(noise(0,28101)*3))%6
+    return style,zone
+
+
+def lining_bank(s,side):
+    """Inner soil envelope for straight, grounded framing instead of warped posts."""
+    ground=floor_y(s,0.)
+    top=min(2.5,wall_height(s,side)-ground-.10)
+    return min(wall_offset(s,side,ground+top*j/12,wall_height(s,side))
+               for j in range(13))
+
+
+def wall_dressing_layout(start):
+    """Connected three-metre bays with explicit end/portal and obstacle clearance."""
+    first=max(0,int((start-1.5)//3.)-1)
+    last=int((start+CHUNK_LEN)/3.)+1
+    for i in range(first,last):
+        s=1.5+i*3.
+        if not start<=s<start+CHUNK_LEN:continue
+        style,zone=lining_section(s)
+        crossing=nearest_junction(s)
+        for side in (-1,1):
+            # Wattle is a local repair on one bank, never a symmetric fence.
+            if style==1 and side>0 and noise(i//2,28117)<.48:continue
+            # Only the excavated side needs a gap; the opposite bank can retain
+            # its lining. Include the full bay and an extra door-jamb margin.
+            if crossing is not None and abs(crossing[0]-s)<4.6 and side in junction_sides(crossing[1]):continue
+            if style==2:
+                centre=zone*24.+12.
+                preferred=1 if wall_width(centre,1)>=wall_width(centre,-1) else -1
+                if side!=preferred:continue
+            samples=tuple(s+d for d in (-1.55,-1.,-.5,0.,.5,1.,1.55))
+            height=min(wall_height(t,side)-floor_y(t,0)-.16 for t in samples)
+            cap=(2.35,1.18 if side>0 else 1.55,1.65,1.85,1.30,2.40)[style]
+            height=min(height,cap*(.92+.08*math.sin(s*.19+side)))
+            if height<.65:continue
+            width=min(lining_bank(t,side) for t in samples)
+            # Scaled thickness in narrower reaches, never move the actual bank.
+            if width<.80:continue
+            blocked=any(ob.lateral*side>0 and abs(ob.s-s)<ob.length*.5+1.7
+                        for ob in obstacles_in_range(s-3.,s+3.))
+            if blocked:continue
+            yield s,side,height,i*2+(side>0)
+
+
+def wall_dressing_chunk(mesh,start):
+    """Bank-hugging plank/wattle repairs, hanging tools, rope and exposed roots.
+
+    Existing earth triangles remain intact. Solid surfaces use wood/metal;
+    only hanging fabric uses the existing non-ballistic animated cloth layer.
+    """
+    for s,side,height,seed in wall_dressing_layout(start):
+        style,zone=lining_section(s)
+        # Section stock/age, six-metre repair campaigns, then small component
+        # tolerances. All keys use global metres; no mutable/random state.
+        age=noise(zone,28501)
+        campaign=int(s//6.)
+        wear=noise(campaign+side*1703,28502)
+        stock=16 if age>.60 else 18
+        repair=wear>.64
+        height*=.82+.18*noise(campaign,28503)
+        span=.90+.09*noise(campaign,28504)
+        middle=(noise(campaign,28505)-.5)*.40
+        banks={}
+        room=min(lining_bank(s+d,side) for d in (-1.55,-1.,-.5,0.,.5,1.,1.55))
+        thickness=min(1.,(room-.72)/.19)
+        def point(x,y,inset=.065):
+            t=s+x*span
+            if t not in banks:banks[t]=lining_bank(t,side)
+            off=side*(banks[t]-inset*thickness)
+            # Board feet, posts and sill share the actual floor at their offset.
+            return world(t,off,floor_y(t,off)+y)
+        def strip(x0,y0,x1,y1,width,layer=18,depth=.075):
+            # Flat split timber with real thickness, rather than round rods.
+            dx,dy=x1-x0,y1-y0
+            length=math.hypot(dx*span,dy)
+            ux,uy=-dy/length*width*.5/span,dx*span/length*width*.5
+            coords=((x0+ux,y0+uy),(x0-ux,y0-uy),
+                    (x1-ux,y1-uy),(x1+ux,y1+uy))
+            front=[point(x,y,depth) for x,y in coords]
+            board_depth=.028+.014*noise(campaign,28506)
+            back=[point(x,y,depth-board_depth) for x,y in coords]
+            offset=(s+x0)*.137
+            uv=((offset,0),(offset+width/1.6,0),
+                (offset+width/1.6,length/2.4),(offset,length/2.4))
+            mesh.quad(*front,layer,uv)
+            mesh.quad(*reversed(back),layer,uv)
+            for j in range(4):
+                k=(j+1)%4
+                mesh.quad(front[j],back[j],back[k],front[k],layer,
+                          ((0,0),(.07,0),(.07,length),(0,length)))
+        # Each bay is a built frame: embedded feet, bottom sleeper, connected
+        # cap and posts. No unrelated free-standing poles on the same wall.
+        for x in (-1.46,1.46):
+            strip(x,-.045,x,height+.015,.14 if style==5 else .085,stock,depth=.16)
+            # Short transverse anchors connect framing to soil without turning
+            # each narrow upright into an implausibly deep, tapered wooden slab.
+            for yy in (height*.66,):
+                anchor=point(x,yy,.12)
+                t=s+x*span
+                bank=wall_offset(t,side,anchor[1],wall_height(t,side))+.025
+                bar(mesh,anchor,world(t,side*bank,anchor[1]),.035,stock,6)
+        strip(-1.50,.035,1.50,.035,.095,stock,depth=.15)
+        if style not in (1,4) and (style!=3 or repair):
+            strip(-1.50,height-.17,1.50,height-.17,.095 if style==5 else .075,stock,depth=.15)
+        if style in (0,2,3):
+            # A broad patch of close-set boards with split, uneven top edges.
+            count=(5+int(wear*3)) if style==3 else (12+int(age*4))
+            for j in range(count):
+                x=(j-(count-1)*.5)*(2.77/(count-1))
+                top=height-.025-.10*noise(campaign*19+j//2,27402)
+                if repair and j in (count//2,count//2+1):top-=.14
+                bottom=-.025
+                if style==2 and j in (3,11):bottom=height*.22
+                # A section shares its timber stock; occasional repairs are
+                # visible, not a different bright material on every board.
+                layer=stock
+                # One contiguous repair, not alternating bright/dark stripes.
+                if repair and count//3<=j<count//3+3:layer=15
+                spacing=2.77/(count-1)
+                width=(.19 if style==3 else spacing*.91)*(.94+.10*noise(campaign*13+j,28507))
+                lean=.018*(noise(campaign,28508)-.5)
+                strip(x,bottom,x+lean,top,width,layer)
+            if style==2:
+                strip(-1.42,.14,1.42,height-.20,.095,15 if repair else stock,depth=.18)
+            else:
+                strip(-1.50,height*(.40+.12*wear),1.50,height*(.40+.12*wear),.075,stock,depth=.15)
+        elif style==4:
+            # Open earth with one low retaining rail and deeply seated uprights.
+            strip(-1.50,.23+.12*wear,1.50,.23+.12*wear,.12+.035*age,stock,depth=.12)
+        elif style==5:
+            # Heavy shoring: broad horizontal retaining boards, a middle post
+            # and two braces terminating at the common ground sill.
+            pitch=.23+.055*age
+            for row in range(max(3,int(height/pitch))):
+                yy=.12+row*pitch
+                end=1.44-(.16 if repair and row%3==1 else 0.)
+                layer=15 if repair and row in (1,2) else stock
+                strip(-1.44,yy,end,yy+.015*(wear-.5),pitch*.85,layer,depth=.075)
+            strip(middle,-.045,middle,height,.14,stock,depth=.16)
+            strip(-1.40,.12,middle-.10,height-.20,.12,stock,depth=.18)
+            if age>.60 or repair:
+                strip(1.40,.12,middle+.10,height-.20,.12,stock,depth=.18)
+        else:
+            # Slender round withies weave around stakes, not flat fence rails.
+            for x in (-.75,0.,.75):
+                strip(x,-.035,x,height,.045,14,depth=.12)
+            rows=max(5,int(height/(.14+.045*age)))
+            for row in range(rows):
+                base=.09+row*(height-.17)/rows
+                for k in range(8):
+                    # A small worn patch between stakes; continuous earth behind.
+                    if wear>.55 and row>rows*.62 and 2<=k<=3:continue
+                    def twig(j):
+                        x=-1.5+j*.375
+                        y=base+(.018+.018*wear)*math.sin(x*2.1+row*.9+campaign)
+                        depth=.105+.035*math.cos(x*math.tau/.75+row*math.pi)
+                        return point(x,y,depth)
+                    bar(mesh,twig(k),twig(k+1),.025+.009*age,14,6,repeat=.8)
+        # Three repairs alternate large, recognizable silhouettes at eye level.
+        kit=seed%8==3 and room>1.06 and height>1.3
+        if kit and style==0:
+            # Rope coiled on a wall peg: sagging elliptical loops, not a torus.
+            bar(mesh,point(.30,height*.83,.11),point(.30,height*.83,.25),.025,10,6)
+            for loop in range(2):
                 for j in range(12):
-                    t=j*math.tau/12;t2=(j+1)*math.tau/12
-                    a=(center[0]+.164*math.cos(t),center[1],center[2]+.164*math.sin(t))
-                    b=(center[0]+.164*math.cos(t2),center[1],center[2]+.164*math.sin(t2))
-                    bar(mesh,a,b,.012,10,5,.2)
-        else:  # bank-side sandbag roll and rope
-            for k in range(3):
-                ss=s+(k-1)*.30
-                foot=world(ss,edge-side*.05,floor_y(ss,edge-side*.05)+.01)
-                sandbag_mesh(mesh,foot,.38,.28,.17,index*29+k,
-                             heading=math.pi*.5-route(ss)[2])
-            a=world(s-.48,edge,.33)
-            b=world(s+.43,edge-side*.09,.25)
-            bar(mesh,a,b,.018,16,7,.28)
+                    t=j*math.tau/12;u=(j+1)*math.tau/12
+                    rx=.20+loop*.018;ry=.32+loop*.022
+                    cy=height*.83-ry
+                    bar(mesh,point(.30+rx*math.sin(t),cy+ry*math.cos(t),.22+loop*.014),
+                        point(.30+rx*math.sin(u),cy+ry*math.cos(u),.22+loop*.014),.012,19,6)
+        elif kit and style==2:
+            # Entrenching spade: D grip, wooden shaft and a shaped steel blade.
+            y=height*.84
+            bar(mesh,point(-.2,y-.16,.24),point(.02,.39,.24),.022,15,7)
+            for a,b in (((-.29,y),(-.12,y)),((-.29,y),(-.25,y-.16)),
+                        ((-.12,y),(-.16,y-.16)),((-.25,y-.16),(-.16,y-.16))):
+                bar(mesh,point(*a,.24),point(*b,.24),.014,10,6)
+            blade=[(-.12,.44),(.16,.44),(.14,.18),(.02,.12),(-.10,.18)]
+            center=point(.02,.29,.25)
+            for j in range(5):
+                mesh.quad(center,point(*blade[j],.24),point(*blade[(j+1)%5],.24),center,10,
+                          ((.5,.5),(0,0),(1,1),(.5,.5)))
+            # Hooks clearly attach the tool to the boards.
+            for yy in (.45,y-.16):
+                bar(mesh,point(-.13,yy,.11),point(-.13,yy,.27),.012,10,6)
+        elif kit and style==1:
+            hanging_fabric(mesh,s,side,seed+81000,span=1.15,drop=min(.70,height*.44))
+        # A small exposed root fragment remains embedded in the ACTUAL soil,
+        # not in the flat construction plane where it could float above boards.
+        if style==2 and seed%6==0:
+            def root(t,y):
+                h=wall_height(t,side)
+                up=min(h-.03,floor_y(t,0)+y)
+                return world(t,side*(wall_offset(t,side,up,h)-.004),up)
+            bar(mesh,root(s,height+.13),root(s+.12,height-.04),.012,14,6)
+
 
 def trench_floor_litter(mesh, start):
     """Tiny stones and compacted clumps, kept close to walls and off nav path."""
@@ -2426,7 +2834,12 @@ def make_chunk(start):
     # Share the exact world-X/Z terrain projection between roofs and props.
     segments=_terrain_route_segments(start)
     edge_height_cache={}
-    stride=SEGMENT
+    stride=SEGMENT*.5
+    normal_cache={}
+    def earth_normal(s,y,side=0):
+        key=(s,y,side)
+        if key not in normal_cache:normal_cache[key]=earth_surface_normal(s,y,side)
+        return normal_cache[key]
     for i in range(int(CHUNK_LEN/stride)):
         s0=start+i*stride;s1=s0+stride
         # Real excavated floor, anchored to BOTH banks. The previous fixed
@@ -2436,17 +2849,21 @@ def make_chunk(start):
         def floor_side_edge(s,side):
             h=wall_height(s,side)
             return side*(wall_offset(s,side,floor_y(s,0.),h)+.035)
-        lo0,hi0=floor_side_edge(s0,-1),floor_side_edge(s0,1)
-        lo1,hi1=floor_side_edge(s1,-1),floor_side_edge(s1,1)
-        for transverse in range(10):
-            t0=transverse/10.;t1=(transverse+1)/10.
-            a0=smooth(lo0,hi0,t0);b0=smooth(lo0,hi0,t1)
-            a1=smooth(lo1,hi1,t0);b1=smooth(lo1,hi1,t1)
-            mesh.quad(world(s0,a0,floor_y(s0,a0)),
-                      world(s1,a1,floor_y(s1,a1)),
-                      world(s1,b1,floor_y(s1,b1)),
-                      world(s0,b0,floor_y(s0,b0)),21,
-                      ((a0,s0*.84),(a1,s1*.84),(b1,s1*.84),(b0,s0*.84)))
+        if s0==int(s0):
+            floor_end=s0+SEGMENT
+            lo0,hi0=floor_side_edge(s0,-1),floor_side_edge(s0,1)
+            lo1,hi1=floor_side_edge(floor_end,-1),floor_side_edge(floor_end,1)
+            for transverse in range(10):
+                t0=transverse/10.;t1=(transverse+1)/10.
+                a0=smooth(lo0,hi0,t0);b0=smooth(lo0,hi0,t1)
+                a1=smooth(lo1,hi1,t0);b1=smooth(lo1,hi1,t1)
+                mesh.quad(world(s0,a0,floor_y(s0,a0)),
+                          world(floor_end,a1,floor_y(floor_end,a1)),
+                          world(floor_end,b1,floor_y(floor_end,b1)),
+                          world(s0,b0,floor_y(s0,b0)),21,
+                          ((a0,s0*.84),(a1,floor_end*.84),(b1,floor_end*.84),(b0,s0*.84)),
+                          normals=(earth_normal(s0,a0),earth_normal(floor_end,a1),
+                                   earth_normal(floor_end,b1),earth_normal(s0,b0)))
         for side in (-1,1):
             w0,w1=wall_width(s0,side),wall_width(s1,side)
             h0,h1=wall_height(s0,side),wall_height(s1,side)
@@ -2477,13 +2894,31 @@ def make_chunk(start):
                         p3=world(s1,side*wall_offset(s1,side,y10,h1),y10)
                         mesh.quad(p0,p1,p2,p3,20,
                                   ((s0*1.12,y00*1.2),(s0*1.12,y01*1.2),
-                                   (s1*1.12,y11*1.2),(s1*1.12,y10*1.2)))
+                                   (s1*1.12,y11*1.2),(s1*1.12,y10*1.2)),
+                                  normals=(earth_normal(s0,y00,side),earth_normal(s0,y01,side),
+                                           earth_normal(s1,y11,side),earth_normal(s1,y10,side)))
+            # Close the subcell cutout seam with a narrow rounded earth shoulder.
+            # Same top anchor as the wall, overlapping the actual exterior grid.
+            # Never bridge a branch mouth or covered tunnel footprint.
+            if not cut and max(tunnel_open(s0),tunnel_open(s1))<.01:
+                def shoulder(ss,t):
+                    h=wall_height(ss,side)
+                    lip=wall_offset(ss,side,h,h)
+                    reach=.58+.09*math.sin(ss*.71+side)
+                    x,z=sides(ss,side*(lip+reach*t))
+                    outer=_exterior_y_world(x,z,segments,edge_height_cache)
+                    y=smooth(h,outer-.025,eased(t))
+                    return (x,y,z)
+                for j in range(4):
+                    ta,tb=j/4.,(j+1)/4.
+                    pts=(shoulder(s0,ta),shoulder(s1,ta),shoulder(s1,tb),shoulder(s0,tb))
+                    mesh.quad(*pts,20,tuple((p[0],p[2]) for p in pts))
             # Outdoor terrain is no longer swept through bends along route
             # offsets: see build_exterior_terrain below. The near-bank earth
             # and the underground roof shell stay generated as before.
 
         # Sparse exposed sleeper remnants, not evenly spaced rail ties.
-        if int(s0)%9==0 and noise(int(s0)//9,990)>.35 and tunnel_open(s0)<.25:
+        if s0==int(s0) and int(s0)%9==0 and noise(int(s0)//9,990)>.35 and tunnel_open(s0)<.25:
             lo,hi=world(s0,-min(.91,wall_width(s0,-1)-.1),floor_y(s0,0)+.026),world(s0,min(.91,wall_width(s0,1)-.1),floor_y(s0,0)+.026)
             lo2,hi2=world(s0+.16,-min(.91,wall_width(s0+.16,-1)-.1),floor_y(s0+.16,0)+.026),world(s0+.16,min(.91,wall_width(s0+.16,1)-.1),floor_y(s0+.16,0)+.026)
             mesh.quad(lo,hi,hi2,lo2,2,((0,0),(2.1,0),(2.1,.18),(0,.18)))
@@ -2496,6 +2931,7 @@ def make_chunk(start):
         hb=(wall_height(b,-1),wall_height(b,1))
         wa=(wall_width(a,-1)+.13,wall_width(a,1)+.13)
         wb=(wall_width(b,-1)+.13,wall_width(b,1)+.13)
+        roof_v_a=roof_v_b=0.0
         for j in range(12):
             ra=-1+2*j/12;rb=-1+2*(j+1)/12
             def roof_shoulders(ss,heights):
@@ -2520,9 +2956,22 @@ def make_chunk(start):
             def ap(ss,rr,ww,heights,extra=0.):
                 half=ww[0] if rr<0 else ww[1]
                 return world(ss,half*rr,arch(ss,rr,heights)+extra)
-            mesh.quad(ap(a,ra,wa,ha),ap(b,ra,wb,hb),
-                      ap(b,rb,wb,hb),ap(a,rb,wa,ha),20,
-                      ((a*.91,ra),(b*.91,ra),(b*.91,rb),(a*.91,rb)))
+            p0,p1,p2,p3=ap(a,ra,wa,ha),ap(b,ra,wb,hb),ap(b,rb,wb,hb),ap(a,rb,wa,ha)
+            next_a=roof_v_a+math.dist(p0,p3)*1.12
+            next_b=roof_v_b+math.dist(p1,p2)*1.12
+            def roof_normal(ss,rr):
+                def rp(t,r):
+                    return ap(t,r,(wall_width(t,-1)+.13,wall_width(t,1)+.13),
+                              (wall_height(t,-1),wall_height(t,1)))
+                e=.02
+                return surface_normal(rp(ss-e,rr),rp(ss+e,rr),
+                                      rp(ss,max(-1.,rr-e)),rp(ss,min(1.,rr+e)),(0.,-1.,0.))
+            mesh.quad(p0,p1,p2,p3,20,
+                      ((a*1.12,roof_v_a),(b*1.12,roof_v_b),
+                       (b*1.12,next_b),(a*1.12,next_a)),
+                      normals=(roof_normal(a,ra),roof_normal(b,ra),
+                               roof_normal(b,rb),roof_normal(a,rb)))
+            roof_v_a,roof_v_b=next_a,next_b
             # Top of tunnel: continuous thin overburden skin, not ordinary
             # outdoor terrain crossing THROUGH the interior arch.
             mesh.quad(ap(a,ra,wa,ha,.24),ap(a,rb,wa,ha,.24),
@@ -2810,6 +3259,7 @@ def make_chunk(start):
     environment_chunk(mesh,start)
     draw_trench_obstacles(mesh,start)
     trench_detail_props(mesh,start)
+    wall_dressing_chunk(mesh,start)
     trench_floor_litter(mesh,start)
     trench_fallen_wood_chunk(mesh,start)
     return mesh.as_array()
@@ -3700,13 +4150,7 @@ class EnemyRenderer:
             ('face',25),('boot',10),('limb',23),
             ('cylinder',10),('cylinder',13),('cylinder',23),('cylinder',24),('cylinder',25)
         ):
-            mesh=MeshBuilder()
-            if shape=='oval':blob(mesh,(0.,0.,0.),(1.,1.,1.),material,18,9,1.4)
-            elif shape=='cube':box(mesh,(0.,0.,0.),(2.,2.,2.),material)
-            elif shape in ('jacket','helmet','face','boot','limb'):
-                build_enemy_sculpture(mesh,shape,material)
-            else:bar(mesh,(0.,-.5,0.),(0.,.5,0.),1.,material,12,1.)
-            data=mesh.as_array()
+            data=_rig_shape_template(shape,material)
             buffer=ctx.buffer(data.tobytes())
             vao=ctx.vertex_array(self.program,[(buffer,'3f 3f 2f 1f',
                                      'in_pos','in_normal','in_uv','in_layer')])
@@ -3799,11 +4243,44 @@ def _rig_shape_template(shape,material):
     """Shared CPU sculpt template for the one-time V3.9.3 GPU rig bind."""
     mesh=MeshBuilder()
     if shape=='oval':blob(mesh,(0.,0.,0.),(1.,1.,1.),material,18,9,1.4)
-    elif shape=='cube':box(mesh,(0.,0.,0.),(2.,2.,2.),material)
+    elif shape=='cube':
+        # Padded carriers/pouches and machined receiver edges, within the
+        # ORIGINAL box bounds. Shared by live skinning and legacy fallback.
+        radius=.16 if material==24 else .05
+        core=1.-radius
+        grid=(-1.,-core,core,1.)
+        for axis in range(3):
+            u=(axis+1)%3;v=(axis+2)%3
+            for sign in (-1.,1.):
+                for i in range(3):
+                    for j in range(3):
+                        points=[];normals=[];uv=[]
+                        for du,dv in ((0,0),(1,0),(1,1),(0,1)):
+                            q=np.zeros(3);q[axis]=sign;q[u]=grid[i+du];q[v]=grid[j+dv]
+                            centre=np.clip(q,-core,core)
+                            n=q-centre;n/=np.linalg.norm(n)
+                            points.append(tuple(centre+radius*n));normals.append(tuple(n))
+                            uv.append(((q[u]+1)*.5,(q[v]+1)*.5))
+                        if sign<0:
+                            points.reverse();normals.reverse();uv.reverse()
+                        mesh.quad(*points,material,uv,normals=normals)
     elif shape in ('jacket','helmet','face','boot','limb'):
         build_enemy_sculpture(mesh,shape,material)
     else:bar(mesh,(0.,-.5,0.),(0.,.5,0.),1.,material,12,1.)
-    return mesh.as_array()
+    data=mesh.as_array()
+    if shape in ('oval','jacket','helmet','face','limb'):
+        # Weld NORMALS only across the UV seam: no movement of anatomy,
+        # no topology/hit-region changes and no extra tessellation.
+        _,inverse=np.unique(np.round(data[:,:3],6),axis=0,return_inverse=True)
+        triangles=data[:,:3].reshape(-1,3,3)
+        area=np.cross(triangles[:,1]-triangles[:,0],triangles[:,2]-triangles[:,0])
+        sums=np.zeros((inverse.max()+1,3),dtype='f4')
+        np.add.at(sums,inverse,np.repeat(area,3,axis=0))
+        lengths=np.linalg.norm(sums,axis=1,keepdims=True)
+        smooth=sums/np.maximum(lengths,1e-8)
+        valid=lengths[inverse,0]>1e-8
+        data[valid,3:6]=smooth[inverse[valid]]
+    return data
 
 
 class StartupScreen:
@@ -3860,8 +4337,9 @@ void main(){color=texture(tex,uv);}
         self.vao.release();self.vbo.release();self.program.release()
 
 
-def generate_chunk_array(start):
-    """Pure CPU process entrypoint; no Pygame/GL resource is created."""
+def generate_chunk_array(start, seed=DEFAULT_SEED):
+    """Explicit seed crosses spawn boundary; no inherited GL/world state."""
+    set_world_seed(seed)
     return make_chunk(float(start))
 
 
@@ -3913,7 +4391,7 @@ class Trench:
         # Query the program once; never throw KeyError on the first draw call.
         try:self.lamp_uniform=self.prog['lamp_positions']
         except KeyError:self.lamp_uniform=self.prog['lamp_positions[0]']
-        self.enemies=EnemyDirector()
+        self.enemies=EnemyDirector(SEED)
         self.arcade=ArcadeRun(_seed=SEED)
         self.death_screen=DeathScreen(self.ctx)
         self.death_age=0.0
@@ -3940,12 +4418,22 @@ class Trench:
             print(f'GPU-skelett kan inte startas, legacy-soldat används: '
                   f'{type(exc).__name__}: {exc}',file=sys.stderr)
             self.enemy_renderer=EnemyRenderer(self.ctx)
+        tactical_path=ROOT/'assets'/'characters'/'tactical'/'soldier.glb'
+        if tactical_path.is_file():
+            try:
+                tactical=TacticalEnemyRenderer(self.ctx,tactical_path,SUN_DIRECTION,MOON_DIRECTION)
+                tactical.ground_height=self.enemy_visual_ground
+                self.enemy_renderer.release()
+                self.enemy_renderer=tactical
+                print('LIVE: taktisk soldat aktiv (befintlig rörelse- och träffmekanik)')
+            except Exception as exc:
+                print(f'Taktisk soldat kunde inte laddas; reservsoldat kvar: {exc}',file=sys.stderr)
         self.pose_lab_index=-1
         self.pose_lab_dummy=EnemyAgent(EnemySpec(-999,5.0,0.0,'cover'))
         self.pose_lab_controller=PoseTransition()
         self.pose_lab_dummy.pose_controller=self.pose_lab_controller
-        # V3.9.7 GLB experiment, F1-only. The legacy renderer remains
-        # authoritative for live enemies and their existing frozen hitboxes.
+        # Optional generic GLB experiment remains F1-only. The fitted tactical
+        # live skin above uses existing visual bones; hitboxes remain in EnemyDirector.
         self.glb_renderer=None
         model_path=ROOT/'assets'/'characters'/'soldier.glb'
         if model_path.is_file():
@@ -3958,7 +4446,7 @@ class Trench:
                       type(exc).__name__,str(exc),file=sys.stderr)
         else:
             print('V3.9.7: valfri assets/characters/soldier.glb saknas; '
-                  'procedursoldat används. Se README.')
+                  'F1 använder den aktiva soldatrenderaren.')
         # Separate renderer: depth-only draw never affects geometry, AI or hitboxes.
         # Fall back to V3.9.1 lighting on OpenGL driver/resource failure.
         self.shadow_renderer=None
@@ -4003,6 +4491,10 @@ class Trench:
         self.ready=queue.Queue(maxsize=16)
         self.pending=set()
         self.generation=0
+        self.world_seed=SEED
+        self.stream_events=deque(maxlen=4096)
+        self.stream_seen=set()
+        self.stream_diagnostics=os.environ.get('SKYTTEGRAV_STREAM_TRACE','0')=='1'
         self.worker_stop=threading.Event()
         self.worker_current_chunk=None
         self.worker_last_ms=0.0
@@ -4047,6 +4539,17 @@ class Trench:
         self.gait_strength=0.0;self.last_moved=0.0
         self.gait_lateral=0.0;self.gait_vertical=0.0;self.gait_roll=0.0
         self.elapsed=0.;self.paused=False;self.fps=0.;self.ui_timer=0.
+        self.demo_mode=False
+        self.demo_shot_lock=threading.RLock()
+        self.demo_shot_epoch=0
+        self.demo_shot_ready=True
+        self.demo_target_agent=None
+        self.demo_pending=False
+        self.demo_targets=()
+        self.demo_notice=''
+        self.demo_keys=set()
+        self.demo_resume_frame=False
+        self.demo_results=deque(maxlen=32)
         self.obstacle_camera_lift=0.0
         self.terrain_eye_base=floor_y(0.,0.)
         self.view_heading=None;self.last_dt=1/60;self.camera_roll=0.0
@@ -4062,6 +4565,7 @@ class Trench:
                       'mossy_rock','wood_planks_dirt','sandbag_mud']
         # Earth originals from V1.9 + six NEW optional Poly Haven originals.
         ph_overrides={0:'brown_mud',1:'roots',2:'mud_forest',3:'mud_forest',4:'brown_mud_02',
+                      8:'wood_planks_dirt',
                       13:'pine_bark',14:'bark_willow',15:'wood_planks',
                       16:'wood_planks_grey',17:'mossy_rock',18:'wood_planks_dirt'}
         ph_folder=ROOT/'assets'/'polyhaven'
@@ -4072,8 +4576,10 @@ class Trench:
         # IDs 20..22 are shader-only terrain IDs, NEVER indexed. Reserve
         # placeholder array layers before 23..25, the soldier's reusable skin.
         enemy_names={23:'uniform',24:'webbing',25:'skin'}
-        for index in range(26):
-            if index in enemy_names:
+        for index in range(28):
+            if index==27:
+                fallback=detail_folder/'field_supplies_atlas.png'
+            elif index in enemy_names:
                 fallback=ROOT/'assets'/'enemies'/(enemy_names[index]+'.png')
             elif index>=20:
                 fallback=ROOT/'assets'/base_names[0]
@@ -4122,7 +4628,7 @@ class Trench:
             try:item.anisotropy=16.0
             except Exception:pass
         print(f'Material: {TEXTURE_SIZE}px; Poly Haven {loaded_color} colors / {loaded_normal} normals; '
-              f'{loaded_local_normals} bundled detail normals; 26 layers total')
+              f'{loaded_local_normals} bundled detail normals; 28 layers total')
         return tex,ntex,have_normals
 
     def _remember_mesh(self,index,data):
@@ -4156,7 +4662,24 @@ class Trench:
             self.shot_chunk_meshes[index]=precomputed
         if hasattr(self,'shot_mesh_cache'):
             self.shot_mesh_cache[index]=precomputed
+        self._stream_event('gpu_ready',index,vertices=len(data))
         return (vbo,vao,len(data))
+
+    def _stream_event(self,phase,index,**details):
+        if not getattr(self,'stream_diagnostics',False):return
+        record=dict(phase=phase,index=index,time=time.perf_counter(),
+            distance=getattr(self,'distance',0.),generation=self.generation,
+            seed=getattr(self,'world_seed',SEED),**details)
+        self.stream_events.append(record)
+        import json
+        print('STREAM '+json.dumps(record),flush=True)
+
+    def _stream_frame(self,phase):
+        if not getattr(self,'stream_diagnostics',False):return
+        for index in sorted(self.chunks):
+            key=(self.generation,index,phase,id(self.chunks[index][0]))
+            if key not in self.stream_seen:
+                self.stream_seen.add(key);self._stream_event(phase,index)
 
     def _publish_chunk_result(self,generation,index,data):
         """Never drop completed work because the bounded delivery queue is full."""
@@ -4189,7 +4712,9 @@ class Trench:
                 start=time.perf_counter()
                 self.worker_current_chunk=index
                 try:
-                    task=pool.submit(generate_chunk_array,index*CHUNK_LEN)
+                    job_seed=getattr(self,'world_seed',SEED)
+                    self._stream_event('cpu_start',index,job_seed=job_seed)
+                    task=pool.submit(generate_chunk_array,index*CHUNK_LEN,job_seed)
                     data=None
                     while not self.worker_stop.is_set():
                         try:
@@ -4199,6 +4724,7 @@ class Trench:
                             continue
                     if data is None:break
                     result=(data,WorldShotMesh(data))
+                    self._stream_event('cpu_ready',index,job_generation=generation,job_seed=job_seed)
                 except Exception as exc:
                     # A broken spawn environment must not leave an empty world.
                     # Retry the current job in the original worker, then keep
@@ -4225,7 +4751,12 @@ class Trench:
             if generation!=self.generation:
                 continue
             try:
-                data=make_chunk(index*CHUNK_LEN)
+                with WORLD_BUILD_LOCK:
+                    if generation!=self.generation:continue
+                    job_seed=SEED
+                    self._stream_event('cpu_start',index,job_seed=job_seed)
+                    data=make_chunk(index*CHUNK_LEN)
+                self._stream_event('cpu_ready',index,job_generation=generation,job_seed=job_seed)
                 # CPU-only; no OpenGL access in worker. Mesh tuple and precise
                 # ballistic soup are passed atomically to the render thread.
                 data=(data,WorldShotMesh(data))
@@ -4304,6 +4835,7 @@ class Trench:
             try:self.todo.put_nowait((self.generation,i))
             except queue.Full:break
             self.pending.add(i)
+            self._stream_event('requested',i)
 
     def _evict_chunks_except(self,wanted):
         for i in list(self.chunks):
@@ -4351,6 +4883,7 @@ class Trench:
         print(f'DEBUG: landat på {target:.1f} m med färdig terräng (samma seed)')
 
     def keep_chunks(self):
+        if getattr(self,'demo_pending',False):return
         """Normal prefetch or atomic debug landing; never display an empty jump."""
         target=self.debug_jump_target
         if target is not None:
@@ -4462,6 +4995,23 @@ class Trench:
         x,z=sides(route_m,lateral)
         return (x,floor_y(route_m,lateral),z)
 
+    def enemy_visual_ground(self,agent,x,z):
+        """Floor samples for corpse presentation only; never changes enemy_position."""
+        spec=agent.spec
+        if spec.branch_index is not None:
+            origin=np.asarray(branch_point(spec.branch_index,spec.branch_side,0.,0.,0.))
+            tip=np.asarray(branch_point(spec.branch_index,spec.branch_side,1.,0.,0.))
+            axis=(tip-origin)[[0,2]];axis/=max(1e-8,np.linalg.norm(axis))
+            depth=float(np.dot(np.array((x,z))-origin[[0,2]],axis))
+            return floor_y(junction_marker(spec.branch_index),0.)+.025*math.sin(depth*.79+spec.branch_index*.73)
+        # Reuse the world's route projection and height functions locally.
+        metres=np.arange(math.floor(agent.route_m)-4,math.floor(agent.route_m)+5,dtype=float)
+        coords=np.asarray([route(float(t))[:2] for t in metres])
+        delta=coords[1:]-coords[:-1]
+        segments=(metres[:-1],coords[:-1],delta,np.maximum(1e-7,np.sum(delta*delta,axis=1)))
+        ss,lateral,_=_nearest_terrain_route(x,z,segments)
+        return (hill_y(ss,spec.exterior_side,lateral) if spec.exterior_side else floor_y(ss,lateral))
+
     def _enemy_shot_occluded(self,agent,t,origin,direction,route_at_shot=None,
                              enemy_route_at_shot=None,meshes_at_shot=None):
         """Conservative 2D trench-wall/obstruction proxy for V3.3.
@@ -4531,6 +5081,19 @@ class Trench:
         return False
 
     def submit_game_hit(self,x,y,source='mouse_simulated',frame=None):
+        # Serialize mode/reset transitions with callback dispatch. Check before
+        # waiting: a trigger received during MARKERA must never wait for resume.
+        epoch=getattr(self,'demo_shot_epoch',0)
+        if getattr(self,'demo_pending',False) or not getattr(self,'demo_shot_ready',True):return None
+        with self._manual_lock():
+            if epoch!=getattr(self,'demo_shot_epoch',0):return None
+            return self._submit_game_hit(x,y,source,frame)
+
+    def _submit_game_hit(self,x,y,source='mouse_simulated',frame=None):
+        if getattr(self,'demo_mode',False):
+            self.begin_demo_shot()
+            return None
+        if not getattr(self,'demo_shot_ready',True):return None
         """Render-time game pixels -> frozen 3D intersection -> game event.
 
         Skjutbanan will supply hit.game_x/game_y from its verified physical
@@ -4604,16 +5167,249 @@ class Trench:
         return self.submit_game_hit(hit.game_x,hit.game_y,
                                     source='physical_verified',frame=frame)
 
+    def _manual_lock(self):
+        return self.__dict__.setdefault('demo_shot_lock',threading.RLock())
+
+    def _manual_mouse_gate(self,blocked):
+        # SDL rejects pending mouse triggers at ingress, including Event.post.
+        # Already-fetched events are discarded by handle's existing batch guard.
+        method=getattr(getattr(pygame,'event',None),'set_blocked' if blocked else 'set_allowed',None)
+        if method is not None:method(pygame.MOUSEBUTTONDOWN)
+
+    def _manual_cancel(self):
+        """Shutdown/death cancels an unscored mark; never invent a verdict."""
+        with self._manual_lock():
+            self.demo_shot_epoch=getattr(self,'demo_shot_epoch',0)+1
+            self.demo_shot_ready=False
+            self.demo_pending=False
+            self.demo_targets=()
+            self.demo_target_agent=None
+            self.demo_presented_frame=None
+            self._manual_mouse_gate(True)
+
+    def _manual_valid_ids(self,frame,eye=None):
+        if frame is None:return ()
+        return tuple(sorted({idx for idx,_ in frame.actor_routes
+            if idx in self.enemies.active and not self.enemies.active[idx].dead
+            and (enemy_shown_to_player_mesh(frame,idx,eye)
+                 if eye is not None and getattr(frame,'world_shot_meshes',None)
+                 else self.player_can_shoot.get(idx,False))}))
+
+    def set_manual_mode(self,enabled):
+        with self._manual_lock():
+            if self.demo_pending:return False
+            preferred=self._manual_valid_ids(self.last_enemy_frame,getattr(self,'last_player_eye',None))
+            self.enemies.set_manual_presentation(enabled,self.distance,preferred)
+            self.demo_mode=bool(enabled)
+            self.demo_shot_epoch=getattr(self,'demo_shot_epoch',0)+1
+            self.demo_shot_ready=False
+            self.demo_notice=''
+            self.demo_target_agent=None
+            # Do not accept a shot against the old multi-target presentation.
+            self._manual_mouse_gate(True)
+            return True
+
+    def _manual_frame_presented(self):
+        # Called only after flip: callback targets always come from a presented
+        # frame, never the new frame being assembled by the renderer.
+        self.demo_presented_frame=self.last_enemy_frame
+        self.demo_presented_eye=getattr(self,'last_player_eye',None)
+        if not self.demo_pending:
+            self.demo_shot_ready=True
+            self._manual_mouse_gate(False)
+
+    def begin_demo_shot(self):
+        """One atomic trigger. Arrivals during MARKERA are dropped, not queued."""
+        epoch=getattr(self,'demo_shot_epoch',0)
+        if self.demo_pending or not getattr(self,'demo_shot_ready',True):return False
+        frame=getattr(self,'demo_presented_frame',self.last_enemy_frame)
+        eye=getattr(self,'demo_presented_eye',getattr(self,'last_player_eye',None))
+        with self._manual_lock():
+            if (epoch!=getattr(self,'demo_shot_epoch',0) or self.demo_pending
+                or not getattr(self,'demo_shot_ready',True) or self.paused
+                or not self.demo_mode or not self.running or not self.arcade.alive or self.debug_jump_target is not None
+                or self.pose_lab_index>=0):return False
+            self.demo_targets=self._manual_valid_ids(frame,eye)
+            self.demo_target_agent=(self.enemies.active[self.demo_targets[0]]
+                                    if len(self.demo_targets)==1 else None)
+            self.demo_pending=True
+            self.demo_shot_epoch=epoch+1
+            self.demo_notice=('Mål '+str(self.demo_targets[0]) if len(self.demo_targets)==1
+                              else 'Inget entydigt mål: SPACE avvisas; M avslutar som bom')
+            self._manual_mouse_gate(True)
+            self.last_dt=0.
+            return True
+
+    def decide_demo_shot(self,hit):
+        with self._manual_lock():return self._decide_demo_shot(hit)
+
+    def _decide_demo_shot(self,hit):
+        """Explicit operator result, with no fabricated coordinates or hit region."""
+        if not self.demo_pending:return False
+        result=None
+        if hit:
+            if len(self.demo_targets)!=1:
+                self.demo_notice='TRÄFF AVVISAD: inget entydigt mål. M = BOM'
+                return False
+            idx=self.demo_targets[0];agent=self.enemies.active.get(idx)
+            if agent is None or agent.dead or agent is not getattr(self,'demo_target_agent',None):
+                self.demo_notice='Målet saknas. M = BOM'
+                return False
+            if not agent.eliminate('manual_demo'):return False
+            self.enemies.eliminated.add(idx)
+            result=(idx,'manual_demo')
+            self.enemies.last_hit=result
+            self.enemy_death_pause=max(self.enemy_death_pause,1.25)
+        self.arcade.player_shot(result)
+        react=getattr(self.enemies,'react_to_player_fire',None)
+        if callable(react):react(self.distance,obstacles_in_range,
+                                fallen_enemy_id=result[0] if result else None)
+        self.enemies.hear_shot(self.distance)
+        self.demo_results.append({'source':'manual_demo','verdict':'hit' if hit else 'miss',
+                                  'target_id':result[0] if result else None})
+        self.hit_notification='MANUELL TRÄFF' if hit else 'MANUELL BOM'
+        self.hit_notification_until=time.monotonic()+2.2
+        self.last_shot_cover=None
+        self.demo_shot_epoch=getattr(self,'demo_shot_epoch',0)+1
+        self.demo_shot_ready=False
+        self.demo_target_agent=None
+        self.demo_pending=False
+        self.demo_notice='';self.demo_targets=()
+        self.demo_resume_frame=True;self.last_dt=0.
+        self.last=time.monotonic()
+        return True
+
+    def restart_world(self,new_seed=None):
+        with self._manual_lock():return self._restart_world(new_seed)
+
+    def _restart_world(self,new_seed=None):
+        """Existing full restart, with optional explicit seed and world-cache reset."""
+        global SEED
+        if getattr(self,'demo_pending',False):
+            self.demo_notice='Bedöm skottet med SPACE eller M före omstart.'
+            return False
+        self.debug_jump_target=None
+        self.debug_jump_stream_chunk=None
+        self.debug_jump_saved_chunks.clear()
+        # A full deterministic restart: cancel old prefetch jobs,
+        # reset first-person pose, and make the start geometry visible.
+        self._invalidate_chunk_generation()
+        if new_seed is not None and int(new_seed)!=SEED:
+            with WORLD_BUILD_LOCK:
+                set_world_seed(new_seed)
+                self.world_seed=SEED
+            self._evict_chunks_except(set())
+            self.mesh_cache.clear();self.shot_mesh_cache.clear()
+            self.shot_chunk_meshes.clear();self.last_world_shot_meshes=()
+            self.last_shot_cover=None
+            if self.shadow_renderer is not None:
+                for _,vao in self.shadow_renderer.world_vaos.values():vao.release()
+                self.shadow_renderer.world_vaos.clear()
+            for name in ('_alive_palette','_fallen'):
+                cache=getattr(self.enemy_renderer,name,None)
+                if cache is not None:cache.clear()
+            self.battlefield.seed=SEED
+            self.arcade._seed=SEED
+            loading=StartupScreen(self.ctx)
+            try:
+                for index in range(4):
+                    loading.show(f'Ny bana, seed {SEED}: sektion {index+1}/4',index/4.)
+                    data=make_chunk(index*CHUNK_LEN)
+                    if index==0:self.home_chunk_data=data
+                    self.chunks[index]=self.chunk(index,data)
+            finally:
+                loading.release();self.ctx.enable(moderngl.DEPTH_TEST)
+        self.distance=0.0
+        self.elapsed=0.0
+        self.step_distance=0.0
+        self.speed=0.0
+        self.mode=5
+        self.auto=True
+        self.paused=False
+        self.look=0.0
+        self.height=1.55
+        self.gait_strength=0.0
+        self.last_moved=0.0
+        self.gait_lateral=0.0
+        self.gait_vertical=0.0
+        self.gait_roll=0.0
+        self.camera_roll=0.0
+        self.brain.reset()
+        self.view_heading=None
+        self.obstacle_camera_lift=0.0
+        self.terrain_eye_base=floor_y(0.,0.)
+        self.enemies.world_seed=SEED
+        self.enemies.reset()
+        self.arcade.reset()
+        self.death_age=0.0
+        self.last_player_eye=None
+        self.player_visibility.clear()
+        self.player_can_shoot.clear()
+        self.visible_opportunity_seconds.clear()
+        self.hostile_shot_counts.clear()
+        self.pose_lab_index=-1
+        self.perception_timer=0.0
+        self.footstep_alert_timer=0.0
+        self.battlefield.reset()
+        self.last_camera_viewproj=None
+        self.last_enemy_frame=None
+        self.hit_notification=''
+        self.hit_notification_until=0.0
+        self.enemy_death_pause=0.0
+        self.frame_max_ms=0.0
+        self.frame_mean_ms=0.0
+        self.chunk_upload_ms=0.0
+        if 0 not in self.chunks:
+            self.chunks[0]=self.chunk(0,self.home_chunk_data)
+        self.demo_shot_epoch=getattr(self,'demo_shot_epoch',0)+1
+        self.demo_shot_ready=False
+        self.demo_target_agent=None
+        self.demo_presented_frame=None
+        self._manual_mouse_gate(True)
+        self.demo_targets=();self.demo_notice='';self.demo_results.clear()
+        self.demo_resume_frame=True
+        self.last=time.monotonic()
+        print(f'OMSTART: seed {SEED}')
+        return True
+
     def handle(self):
+        # Drop triggers from the entire batch containing a pending/accepted shot.
+        # Nothing received during MARKERA is replayed after the decision.
+        demo_batch_blocked=getattr(self,'demo_pending',False)
         for event in pygame.event.get():
-            if event.type==pygame.QUIT:self.running=False
+            if event.type==pygame.QUIT:
+                self.running=False;self._manual_cancel();return
             if event.type==pygame.VIDEORESIZE:
                 self.frame_size=(max(400,event.w),max(260,event.h))
+            if event.type==pygame.KEYUP and hasattr(self,'demo_keys'):
+                self.demo_keys.discard(event.key)
             if event.type==pygame.MOUSEBUTTONDOWN and event.button==1:
+                if getattr(self,'demo_mode',False):
+                    if not demo_batch_blocked:
+                        demo_batch_blocked=self.begin_demo_shot()
+                    continue
                 if self.arcade.alive and not self.paused:
                     self.submit_game_hit(*event.pos,source='mouse_simulated')
                 continue
             if event.type!=pygame.KEYDOWN:continue
+            if event.key==pygame.K_ESCAPE:
+                self.running=False;self._manual_cancel();return
+            if event.key in (pygame.K_b,pygame.K_SPACE,pygame.K_m,pygame.K_r,pygame.K_s) and hasattr(self,'demo_keys'):
+                repeated=bool(getattr(event,'repeat',False)) or event.key in self.demo_keys
+                self.demo_keys.add(event.key)
+                if (getattr(self,'demo_mode',False) or event.key in (pygame.K_b,pygame.K_r,pygame.K_s)) and repeated:continue
+            if getattr(self,'demo_pending',False):
+                if event.key in (pygame.K_r,pygame.K_s):
+                    self.demo_notice='Bedöm skottet med SPACE eller M före omstart.'
+                if event.key in (pygame.K_SPACE,pygame.K_m):
+                    self.decide_demo_shot(event.key==pygame.K_SPACE)
+                continue
+            if demo_batch_blocked:continue
+            if event.key==pygame.K_b:
+                self.set_manual_mode(not self.demo_mode)
+                demo_batch_blocked=True
+                continue
+            if getattr(self,'demo_mode',False) and event.key in (pygame.K_t,pygame.K_SPACE,pygame.K_m):continue
             if event.key==pygame.K_t:
                 if self.arcade.alive and not self.paused:
                     ww,hh=pygame.display.get_surface().get_size()
@@ -4680,58 +5476,28 @@ class Trench:
             elif event.key==pygame.K_UP:self.debug_jump(25.0)
             elif event.key==pygame.K_DOWN:self.debug_jump(-25.0)
             elif event.key in (pygame.K_SPACE,pygame.K_p):self.paused=not self.paused
-            elif event.key==pygame.K_r:
-                self.debug_jump_target=None
-                self.debug_jump_stream_chunk=None
-                self.debug_jump_saved_chunks.clear()
-                # A full deterministic restart: cancel old prefetch jobs,
-                # reset first-person pose, and make the start geometry visible.
-                self._invalidate_chunk_generation()
-                self.distance=0.0
-                self.elapsed=0.0
-                self.step_distance=0.0
-                self.speed=0.0
-                self.mode=5
-                self.auto=True
-                self.paused=False
-                self.look=0.0
-                self.height=1.55
-                self.gait_strength=0.0
-                self.last_moved=0.0
-                self.gait_lateral=0.0
-                self.gait_vertical=0.0
-                self.gait_roll=0.0
-                self.camera_roll=0.0
-                self.brain.reset()
-                self.view_heading=None
-                self.obstacle_camera_lift=0.0
-                self.terrain_eye_base=floor_y(0.,0.)
-                self.enemies.reset()
-                self.arcade.reset()
-                self.death_age=0.0
-                self.last_player_eye=None
-                self.player_visibility.clear()
-                self.player_can_shoot.clear()
-                self.visible_opportunity_seconds.clear()
-                self.hostile_shot_counts.clear()
-                self.pose_lab_index=-1
-                self.perception_timer=0.0
-                self.footstep_alert_timer=0.0
-                self.battlefield.reset()
-                self.last_camera_viewproj=None
-                self.last_enemy_frame=None
-                self.hit_notification=''
-                self.hit_notification_until=0.0
-                self.enemy_death_pause=0.0
-                self.frame_max_ms=0.0
-                self.frame_mean_ms=0.0
-                self.chunk_upload_ms=0.0
-                if 0 not in self.chunks:
-                    self.chunks[0]=self.chunk(0,self.home_chunk_data)
+            elif event.key in (pygame.K_r,pygame.K_s):
+                seed=None
+                if event.key==pygame.K_s:
+                    seed=SEED
+                    while seed==SEED:seed=random.SystemRandom().randrange(1,2**31)
+                self.restart_world(seed)
+                demo_batch_blocked=True
             elif event.key==pygame.K_0:self.auto=True
             elif pygame.K_1<=event.key<=pygame.K_9:
                 self.auto=False;self.mode=event.key-pygame.K_1
     def update(self,dt):
+        if getattr(self,'demo_mode',False):
+            with self._manual_lock():return self._update_game(dt)
+        return self._update_game(dt)
+
+    def _update_game(self,dt):
+        if getattr(self,'demo_pending',False) and not self.arcade.alive:
+            self._manual_cancel()
+        if getattr(self,'demo_pending',False) or getattr(self,'demo_resume_frame',False):
+            self.demo_resume_frame=False
+            self.last_dt=0.
+            return
         if self.debug_jump_target is not None:
             # A staging jump freezes gameplay, hit timers and virtual movement.
             # The old terrain stays rendered while its replacement is built.
@@ -5039,6 +5805,11 @@ class Trench:
         return self.enemy_position(spec)
 
     def draw(self):
+        if getattr(self,'demo_mode',False):
+            with self._manual_lock():return self._draw_game()
+        return self._draw_game()
+
+    def _draw_game(self):
         ww,hh=pygame.display.get_surface().get_size()
         self.ctx.viewport=(0,0,ww,hh)
         self.ctx.clear(.18,.23,.29,1.0,depth=1.0)
@@ -5100,8 +5871,8 @@ class Trench:
             visible=[a for a in self.enemies.active.values()
                      if abs(a.route_m-self.distance)<65.]
             position_at=self.enemy_position
-        # The downloaded GLB is *preview-only* until visible model/physical
-        # hitbox alignment has been measured. Keep the current live renderer.
+        # Generic GLB stays preview-only; the fitted tactical skin is already
+        # selected as enemy_renderer during normal startup.
         active_renderer=(self.glb_renderer if self.glb_renderer is not None
                          and self.pose_lab_index>=0 else self.enemy_renderer)
         instances=(active_renderer.collect_instances(visible,position_at,
@@ -5112,6 +5883,7 @@ class Trench:
                 try:
                     shadow.draw_maps(self.chunks,active_renderer,instances,eye,emitters,
                         (ww,hh),max(0,math.floor(self.distance/CHUNK_LEN)),self.elapsed)
+                    self._stream_frame('shadow_draw')
                 except Exception as exc:
                     # Restore old lighting instead of crashing on unsupported GL.
                     print(f'Skuggor inaktiverade efter renderfel: {type(exc).__name__}: {exc}',file=sys.stderr)
@@ -5130,6 +5902,7 @@ class Trench:
         self.last_enemy_frame=replace(self.last_enemy_frame,
                                       world_shot_meshes=self.last_world_shot_meshes)
         for i in sorted(self.chunks):self.chunks[i][1].render()
+        self._stream_frame('main_draw')
         # All actors share GPU-resident geometry and materials; one set of
         # instance transforms per frame. World depth buffer occludes enemies.
         if visible:
@@ -5141,7 +5914,12 @@ class Trench:
         self.battlefield_renderer.draw(self.battlefield,mat,eye,right,up)
         if not self.arcade.alive and self.pose_lab_index<0:
             self.death_screen.draw(self.death_age,self.arcade,ww,hh)
+        mode='MANUELL' if self.demo_mode else 'NORMAL'
+        lines=((mode+f' | B = läge | S = ny bana | seed {SEED}',) if not self.demo_pending else
+               ('MANUELL | MARKERA','SPACE = TRÄFF    M = BOM',self.demo_notice))
+        self.death_screen.draw_status(lines,ww,hh)
         pygame.display.flip()
+        self._manual_frame_presented()
     def _record_profile(self,phase_ms,transition=False):
         """Compare pose switches versus steady motion, plus mesh activity."""
         self.profile_samples.append(tuple(phase_ms))
@@ -5239,6 +6017,11 @@ class Trench:
             pygame.quit()
 
 if __name__=='__main__':
+    import argparse
+    parser=argparse.ArgumentParser(description='Den oändliga skyttegraven')
+    parser.add_argument('--seed',type=int,default=DEFAULT_SEED,
+                        help='Återskapa en bana; standard är 1944')
+    set_world_seed(parser.parse_args().seed)
     try:Trench().run()
     except Exception as error:
         print(f'3D-test could not start: {type(error).__name__}: {error}',file=sys.stderr)

@@ -182,17 +182,21 @@ class AtomicJumpTests(unittest.TestCase):
         t=self.new_world()
         t.home_chunk_data=self.mesh()
         t.battlefield=ResetCounter()
+        t.demo_results=[]
         t.elapsed=5.0;t.hit_notification='old';t.hit_notification_until=3.0
         t.frame_max_ms=99.0;t.frame_mean_ms=33.0
         t.debug_jump(450);self.settle(t);t.keep_chunks()
         self.assertGreater(t.todo.qsize(),0)
         pg=types.SimpleNamespace()
-        constants=('QUIT','VIDEORESIZE','MOUSEBUTTONDOWN','KEYDOWN','K_t',
+        constants=('QUIT','VIDEORESIZE','MOUSEBUTTONDOWN','KEYDOWN','KEYUP','K_b','K_m','K_t',
             'K_ESCAPE','K_F9','K_F10','K_F11','K_F3','K_F4','K_F5',
-            'K_F6','K_F2','K_F7','K_F8','K_UP','K_DOWN','K_SPACE','K_p','K_r')
+            'K_F6','K_F2','K_F7','K_F8','K_UP','K_DOWN','K_SPACE','K_p','K_r','K_s')
         for index,name in enumerate(constants):setattr(pg,name,index+101)
         pg.event=types.SimpleNamespace(get=lambda:[types.SimpleNamespace(type=pg.KEYDOWN,key=pg.K_r)])
-        with mock.patch.object(game,'pygame',pg):
+        t.ctx.enable=mock.Mock()
+        with mock.patch.object(game,'pygame',pg),mock.patch.object(game,'StartupScreen'), \
+             mock.patch.object(game.moderngl,'DEPTH_TEST',2,create=True), \
+             mock.patch.object(t,'chunk',side_effect=lambda *a:(FakeGL(),FakeGL(),6)):
             t.handle()
         self.assertIsNone(t.debug_jump_target)
         self.assertIsNone(t.debug_jump_stream_chunk)

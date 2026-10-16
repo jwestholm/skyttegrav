@@ -109,7 +109,10 @@ def to_bind_mesh(parts,shape_data,part_model):
     arrays=[]
     count=len(parts)
     for idx,part in enumerate(parts):
-        src=shape_data[(part[0],part[1])]
+        # Live rifle stock/handguard use the existing dark equipment surface,
+        # not the terrain bark layer. Identity, size and weapon bone stay fixed.
+        visual_material=10 if idx>=count-8 and part[1]==13 else part[1]
+        src=shape_data[(part[0],visual_material)]
         m=part_model((0.,0.,0.),0.,part).astype('f4')
         vertices=src.copy()
         vertices[:,:3]=src[:,:3]@m[:3,:3].T+m[:3,3]
@@ -212,7 +215,8 @@ class SkeletalEnemyRenderer:
             controller=getattr(agent,'pose_controller',None)
             bones=(controller.sample(agent) if controller is not None
                    else bone_matrices(agent,'auto' if pose is None else pose))
-            out.append((agent.spec.enemy_id%3,model,bones,agent))
+            variant=agent.spec.visual_variant
+            out.append((agent.spec.enemy_id%3 if variant is None else variant,model,bones,agent))
         return out
 
     def draw(self,agents,position_at,heading_at,projection_view,eye,

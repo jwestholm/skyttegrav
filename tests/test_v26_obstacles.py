@@ -24,6 +24,7 @@ def runtime_geometry():
         'branch_length','branch_center_shift','cover_distance','bend_marker',
         'bend_direction','near_junction','landscape_type','wall_width',
         'wall_offset','surface_material','hill_y','world_on_ground',
+        'surface_normal','earth_surface_normal',
         'floor_y','tunnel_open','tunnel_drop','crater_height','is_branch_excavation',
         'oil_lantern','dugout_furnishings','battlefield_debris_chunk',
         'world_excavation_masks','soil_over_excavation',

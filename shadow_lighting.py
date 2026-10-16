@@ -12,7 +12,7 @@ SUN_SHADOW_RES = 1536
 MOON_SHADOW_RES = 1024
 LAMP_SHADOW_RES = 768
 SHADOW_RADIUS_METRES = 42.0
-LAMP_SHADOW_MAX_DISTANCE = 7.5
+LAMP_SHADOW_MAX_DISTANCE = 18.0
 
 
 # The shadow-only vertex shader draws existing VBOs without uploading geometry.
@@ -55,6 +55,7 @@ uniform mat4 shadow_sun_mvp;
 uniform mat4 shadow_moon_mvp;
 uniform mat4 shadow_lamp_mvp;
 uniform int shadow_lamp_index;
+uniform float shadow_lamp_weight;
 
 float shadow_pcf(sampler2D depth_map, mat4 light_matrix, vec3 world_pos, float bias) {
     vec4 clip = light_matrix * vec4(world_pos,1.0);
@@ -111,15 +112,16 @@ def perspective(fov,aspect,near,far):
                      (0,0,-1,0)),dtype='f4')
 
 
-def directional_matrix(camera_pos,light_direction,span=SHADOW_RADIUS_METRES):
-    """Follow the player with stable, camera-relative directional shadows."""
+def directional_matrix(camera_pos,light_direction,span=SHADOW_RADIUS_METRES,
+                       resolution=SUN_SHADOW_RES):
+    """Snap in LIGHT texels, not half-metre world-axis jumps."""
     direction=np.asarray(light_direction,dtype='f4')
     direction/=max(1e-7,float(np.linalg.norm(direction)))
-    # Snapping reduces visual shimmer for a slowly advancing on-rails camera.
-    centre=np.asarray((round(float(camera_pos[0])*2)/2,1.4,
-                       round(float(camera_pos[2])*2)/2),dtype='f4')
-    eye=centre+direction*53.0
-    return orthographic(-span,span,-span,span,.1,122.) @ look_at(eye,centre)
+    centre=np.asarray((camera_pos[0],1.4,camera_pos[2]),dtype='f4')
+    matrix=orthographic(-span,span,-span,span,.1,122.) @ look_at(centre+direction*53.,centre)
+    origin=matrix[:2,3]*float(resolution)*.5
+    matrix[:2,3]+=(np.round(origin)-origin)*(2./resolution)
+    return matrix
 
 
 def lamp_matrix(position):
@@ -136,10 +138,26 @@ def closest_shadow_lamp(lights,camera_pos,max_distance=LAMP_SHADOW_MAX_DISTANCE)
     return idx if distances[idx]<=max_distance**2 else -1
 
 
+def lamp_shadow_weight(lights,camera_pos,index):
+    """Continuous handover of the one-map budget; no hard 7.5 m activation.
+
+    Prepare outside the old visible transition. At an equal-distance switch
+    both candidates have zero weight, so changing map ownership cannot flash.
+    """
+    if index<0:return 0.
+    distances=[math.dist(p,camera_pos) for p in lights]
+    def ease(t):
+        t=max(0.,min(1.,t));return t*t*(3.-2.*t)
+    strength=ease((LAMP_SHADOW_MAX_DISTANCE-distances[index])/6.)
+    others=[d for i,d in enumerate(distances) if i!=index]
+    if others:strength*=ease((min(others)-distances[index])/3.)
+    return strength
+
+
 class ShadowRenderer:
     """One depth-only program + three reusable depth FBOs, no mesh copies.
 
-    The current/adjacent chunks are rendered.  A finite local light cone from
+    All resident chunks participate, matching the visible world pass.  A finite local light cone from
     ONE nearby lantern avoids six cubemap renders per lamp on GTX 1070.
     """
     def __init__(self,ctx,sun_direction,moon_direction):
@@ -157,6 +175,9 @@ class ShadowRenderer:
         try:
             for size in self.sizes:
                 depth=ctx.depth_texture((size,size))
+                # shadow_pcf samples raw depth with sampler2D and compares in GLSL.
+                # Hardware comparison mode requires sampler2DShadow instead.
+                depth.compare_func=''
                 depth.repeat_x=False;depth.repeat_y=False
                 depth.filter=(moderngl.NEAREST,moderngl.NEAREST)
                 fbo=ctx.framebuffer(depth_attachment=depth)
@@ -195,8 +216,9 @@ class ShadowRenderer:
                   frame_size,route_chunk,time_seconds):
         if not self.enabled:return
         self.lamp_index=closest_shadow_lamp(lights,camera_pos)
+        self.lamp_weight=lamp_shadow_weight(lights,camera_pos,self.lamp_index)
         mats=[directional_matrix(camera_pos,self.light_dirs[0]),
-              directional_matrix(camera_pos,self.light_dirs[1]),
+              directional_matrix(camera_pos,self.light_dirs[1],resolution=MOON_SHADOW_RES),
               lamp_matrix(lights[self.lamp_index]) if self.lamp_index>=0
               else np.eye(4,dtype='f4')]
         self.matrices=tuple(mats)
@@ -205,7 +227,9 @@ class ShadowRenderer:
         for idx in list(self.world_vaos):
             if idx not in chunks or self.world_vaos[idx][0] is not chunks[idx][0]:
                 self.world_vaos.pop(idx)[1].release()
-        keys=[i for i in sorted(chunks) if abs(i-route_chunk)<=1]
+        # Main rendering draws all resident chunks. Route IDs are not spatial
+        # bounds on winding terrain; never exclude an already visible caster.
+        keys=sorted(chunks)
         prg=self.program
         prg['time_seconds'].value=float(time_seconds)
         try:
@@ -242,6 +266,8 @@ class ShadowRenderer:
     def bind_material(self,program):
         program['shadow_mode'].value=int(self.enabled)
         program['shadow_lamp_index'].value=self.lamp_index if self.enabled else -1
+        try:program['shadow_lamp_weight'].value=getattr(self,'lamp_weight',0.) if self.enabled else 0.
+        except KeyError:pass  # Actor materials without local lantern lighting.
         for idx,name in enumerate(('shadow_sun_mvp','shadow_moon_mvp','shadow_lamp_mvp')):
             program[name].write(self.matrices[idx].T.tobytes())
             self.maps[idx].use(location=idx+2)
